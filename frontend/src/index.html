@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!--
+    Strict Content-Security-Policy:
+    - No inline scripts (nonce-less <script> tags blocked)
+    - No external CDN resources — everything is local
+    - Fonts allowed only from Google Fonts (for Inter + JetBrains Mono)
+    - No eval(), no data: URIs for scripts
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src http://127.0.0.1:8765 ws://127.0.0.1:47291;">
+  <meta name="viewport" content="width=380, initial-scale=1.0">
+  <link rel="stylesheet" href="style.css">
+  <title>Vault-Zero</title>
+</head>
+<body>
+
+  <!-- =========================================================
+       SCREEN 1: UNLOCK
+       ========================================================= -->
+  <div id="screen-unlock" class="screen screen-unlock active">
+    <div class="unlock-logo-group">
+      <p class="unlock-logo">Vault-Zero</p>
+      <p class="unlock-subtitle">Local Identity Vault</p>
+    </div>
+    
+    <img src="../assets/Vault-zero-logo.png" alt="Vault-Zero" class="unlock-logo-img">
+
+    <div class="unlock-form">
+      <input
+        id="unlock-password"
+        type="password"
+        placeholder="Master password"
+        autocomplete="current-password"
+        spellcheck="false"
+        aria-label="Master password"
+      >
+      <button id="unlock-btn" type="button">Unlock</button>
+      <p id="unlock-error" class="unlock-error" aria-live="polite"></p>
+      <div style="text-align: center; margin-top: 4px;">
+        <a href="#" id="forgot-password-link" class="forgot-link">Forgot password?</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 1.5: SETUP (NEW USER)
+       ========================================================= -->
+  <div id="screen-setup" class="screen screen-unlock">
+    <div class="unlock-logo-group">
+      <p class="unlock-logo">Vault-Zero</p>
+      <p class="unlock-subtitle">Local Identity Vault</p>
+    </div>
+    
+    <img src="../assets/Vault-zero-logo.png" alt="Vault-Zero" class="unlock-logo-img">
+
+    <div class="setup-header" style="text-align: center; margin-bottom: 12px; width: 100%;">
+      <p style="font-size: 13px; font-weight: 600; margin: 0; color: var(--text);">Create your master password</p>
+    </div>
+
+    <div class="warning-banner" style="margin-bottom: 16px; border: 1px solid var(--danger); background: rgba(248, 113, 113, 0.05); color: var(--danger); width: 100%;">
+      <p class="warning-title">⚠ IMPORTANT WARNING</p>
+      <p class="warning-text">This password encrypts everything in your vault. If you forget it, your data cannot be recovered. There is no reset. Write it down somewhere safe.</p>
+    </div>
+
+    <div class="unlock-form">
+      <input
+        id="setup-password"
+        type="password"
+        placeholder="Master Password (min 8 chars)"
+        autocomplete="new-password"
+        spellcheck="false"
+        aria-label="Master Password"
+      >
+      <input
+        id="setup-confirm-password"
+        type="password"
+        placeholder="Confirm Password"
+        autocomplete="new-password"
+        spellcheck="false"
+        aria-label="Confirm Password"
+      >
+
+      <!-- Password Strength Indicator -->
+      <div class="strength-container" style="width: 100%; margin-top: 4px; margin-bottom: 4px;">
+        <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--dim); margin-bottom: 4px;">
+          <span>Password Strength</span>
+          <span id="strength-label">Too short</span>
+        </div>
+        <div class="strength-bar-bg" style="height: 4px; background: var(--border); border-radius: 2px; overflow: hidden;">
+          <div id="strength-bar" style="width: 0%; height: 100%; background: var(--danger); transition: all var(--transition);"></div>
+        </div>
+      </div>
+
+      <button id="setup-btn" type="button" disabled>Create Vault</button>
+      <p id="setup-error" class="unlock-error" aria-live="polite"></p>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 1.6: RECOVERY CODE DISPLAY
+       ========================================================= -->
+  <div id="screen-recovery-code" class="screen screen-unlock">
+    <div class="unlock-logo-group">
+      <p class="unlock-logo">Vault-Zero</p>
+      <p class="unlock-subtitle">Local Identity Vault</p>
+    </div>
+    
+    <img src="../assets/Vault-zero-logo.png" alt="Vault-Zero" class="unlock-logo-img">
+
+    <!-- Danger-colored warning banner above it -->
+    <div class="warning-banner" style="margin-bottom: 20px; border: 1px solid var(--danger); background: rgba(248, 113, 113, 0.05); color: var(--danger); width: 100%;">
+      <p class="warning-title">⚠ IMPORTANT: SHOWN ONCE ONLY</p>
+      <p class="warning-text">If you ever forget your master password, this code is the ONLY way to regain access to your vault. Save it now in a safe offline location.</p>
+    </div>
+
+    <div style="width: 100%; margin-bottom: 16px;">
+      <div class="credential-box-container">
+        <input id="recovery-code-display" type="text" readonly spellcheck="false" class="credential-input" style="font-family: var(--font-mono); font-size: 12px; text-align: center; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; color: var(--accent);">
+        <button id="btn-copy-recovery-code" class="btn-copy" type="button">Copy</button>
+      </div>
+    </div>
+
+    <!-- Checkbox to enable continue button -->
+    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 20px; font-size: 11px; color: var(--dim); user-select: none; width: 100%;">
+      <input type="checkbox" id="chk-saved-code" style="width: auto; margin: 0; cursor: pointer; accent-color: var(--accent);">
+      <label for="chk-saved-code" style="cursor: pointer; line-height: 1.4; text-align: left;">I have written down or securely saved this recovery code.</label>
+    </div>
+
+    <button id="btn-continue-to-vault" type="button" style="width:100%;" disabled>CONTINUE TO VAULT</button>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 1.7: FORGOT PASSWORD (RECOVERY)
+       ========================================================= -->
+  <div id="screen-recover" class="screen screen-unlock">
+    <div class="unlock-logo-group">
+      <p class="unlock-logo">Vault-Zero</p>
+      <p class="unlock-subtitle">Recover Vault Access</p>
+    </div>
+    
+    <img src="../assets/Vault-zero-logo.png" alt="Vault-Zero" class="unlock-logo-img">
+
+    <div class="unlock-form">
+      <div class="form-group" style="margin-bottom: 8px;">
+        <label for="forgot-recovery-code" style="margin-bottom: 4px; display: block;">Recovery Code</label>
+        <input
+          id="forgot-recovery-code"
+          type="text"
+          placeholder="VAULT-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
+          spellcheck="false"
+          autocomplete="off"
+          style="font-family: var(--font-mono); font-size: 11px; text-transform: uppercase;"
+        >
+      </div>
+
+      <div class="form-group" style="margin-bottom: 8px;">
+        <label for="forgot-new-password" style="margin-bottom: 4px; display: block;">New Master Password</label>
+        <input
+          id="forgot-new-password"
+          type="password"
+          placeholder="New Password (min 8 chars)"
+          autocomplete="new-password"
+          spellcheck="false"
+        >
+      </div>
+
+      <div class="form-group" style="margin-bottom: 12px;">
+        <label for="forgot-confirm-password" style="margin-bottom: 4px; display: block;">Confirm New Password</label>
+        <input
+          id="forgot-confirm-password"
+          type="password"
+          placeholder="Confirm New Password"
+          autocomplete="new-password"
+          spellcheck="false"
+        >
+      </div>
+
+      <button id="forgot-btn" type="button" style="width: 100%;">Recover Vault</button>
+      <p id="forgot-error" class="unlock-error" aria-live="polite" style="color: var(--danger);"></p>
+      <div style="text-align: center; margin-top: 4px;">
+        <a href="#" id="back-to-unlock-link" class="forgot-link">Back to Unlock</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 2: DASHBOARD
+       ========================================================= -->
+  <div id="screen-dashboard" class="screen">
+    <div class="screen-header">
+      <img src="../assets/Vault-zero-logo.png" 
+           alt="Vault-Zero"
+           class="dashboard-logo-img">
+      <div style="display:flex; gap:12px; align-items:center;">
+        <button id="btn-open-agents" class="header-action" title="Agents" aria-label="View agents">
+          Agents
+        </button>
+        <button id="btn-open-audit" class="header-action" title="Audit log" aria-label="View audit log">
+          Audit
+        </button>
+        <button id="btn-lock" class="header-action" title="Lock vault" aria-label="Lock vault">
+          Lock
+        </button>
+      </div>
+    </div>
+
+    <div class="items-container" id="items-container">
+      <div class="empty-state" id="empty-state">No secrets stored yet.</div>
+    </div>
+
+    <div class="footer-actions">
+      <button id="btn-add-item" type="button" style="width:100%;">+ Add Secret</button>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 3: ADD ITEM
+       ========================================================= -->
+  <div id="screen-add-item" class="screen">
+    <div class="screen-header">
+      <button id="btn-back-from-add" class="header-action" aria-label="Back to dashboard">
+        ← Back
+      </button>
+      <h1>Add Secret</h1>
+      <span></span>
+    </div>
+
+    <div class="form-group">
+      <label for="add-category">Category</label>
+      <select id="add-category" aria-label="Category">
+        <option value="API KEY">API KEY</option>
+        <option value="URL">URL</option>
+        <option value="ID">ID</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label for="add-label">Label</label>
+      <input
+        id="add-label"
+        type="text"
+        placeholder="e.g. OpenAI Key"
+        maxlength="120"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Secret label"
+      >
+    </div>
+
+    <div class="form-group">
+      <label for="add-value">Secret Value</label>
+      <input
+        id="add-value"
+        type="password"
+        placeholder="Paste your secret here"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Secret value"
+      >
+    </div>
+
+    <p id="add-error" class="form-error" aria-live="polite"></p>
+
+    <button id="btn-save-item" type="button" style="width:100%;">Save Secret</button>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 4: PERMISSION DIALOG (fixed overlay)
+       ========================================================= -->
+  <div id="permission-overlay" class="permission-overlay" role="alertdialog" aria-modal="true" aria-labelledby="perm-heading">
+    <div class="permission-card">
+      <div class="permission-header">
+        <h2 id="perm-heading">Agent Request</h2>
+        <p id="perm-agent-id" class="permission-agent-id"></p>
+      </div>
+
+      <div class="permission-action-box" id="perm-action-text">
+        Waiting for permission request…
+      </div>
+
+      <div class="permission-timer-box">
+        Auto-denying in <span id="perm-countdown" class="permission-timer">60s</span>
+      </div>
+
+      <div class="permission-buttons">
+        <button id="btn-deny-perm" class="btn-danger" type="button">Deny</button>
+        <button id="btn-approve-perm" type="button">Approve</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 5: AUDIT LOG
+       ========================================================= -->
+  <div id="screen-audit" class="screen">
+    <div class="screen-header">
+      <button id="btn-back-from-audit" class="header-action" aria-label="Back to dashboard">
+        ← Back
+      </button>
+      <h1>Audit Log</h1>
+      <span></span>
+    </div>
+
+    <div class="audit-container" id="audit-container">
+      <div class="empty-state">No audit entries yet.</div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       SCREEN 6: AGENTS
+       ========================================================= -->
+  <div id="screen-agents" class="screen">
+    <div class="screen-header">
+      <button id="btn-back-from-agents" class="header-action" aria-label="Back to dashboard">
+        ← Back
+      </button>
+      <h1>Agents</h1>
+      <button id="btn-add-agent" class="header-action" title="Register agent" aria-label="Register new agent">
+        + New
+      </button>
+    </div>
+
+    <div class="items-container" id="agents-container">
+      <div class="empty-state" id="agents-empty-state">No agents registered.</div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODALS & OVERLAYS
+       ========================================================= -->
+  <div id="agent-register-overlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="register-heading">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="register-heading">Register Agent</h2>
+        <button id="btn-close-register" class="modal-close-btn" aria-label="Close">✕</button>
+      </div>
+
+      <div class="form-group">
+        <label for="register-agent-id">Agent ID / Name</label>
+        <input
+          id="register-agent-id"
+          type="text"
+          placeholder="e.g. cursor"
+          maxlength="50"
+          spellcheck="false"
+          autocomplete="off"
+        >
+      </div>
+
+      <div class="form-group">
+        <label>Permissions (Select Secrets)</label>
+        <div id="register-permissions-list" class="permissions-checklist">
+          <!-- Dynamically populated checkboxes -->
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="register-ttl">TTL (Expiration)</label>
+        <select id="register-ttl">
+          <option value="1">1 Hour</option>
+          <option value="24">24 Hours</option>
+          <option value="168">7 Days</option>
+          <option value="720">30 Days</option>
+          <option value="8760">1 Year</option>
+          <option value="never">Never</option>
+        </select>
+      </div>
+
+      <p id="register-error" class="form-error" aria-live="polite"></p>
+
+      <button id="btn-submit-register" type="button" style="width:100%;">Create Agent</button>
+    </div>
+  </div>
+
+  <div id="agent-credentials-overlay" class="modal-overlay" role="alertdialog" aria-modal="true" aria-labelledby="credentials-heading">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="credentials-heading">Agent Credentials</h2>
+      </div>
+
+      <div class="warning-banner">
+        <p class="warning-title">⚠ IMPORTANT: SHOWN ONCE ONLY</p>
+        <p class="warning-text">Copy the Vault API Key now. It will never be displayed again. If lost, you must revoke and re-create this agent card.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Vault API Key</label>
+        <div class="credential-box-container">
+          <input id="credential-api-key" type="text" readonly spellcheck="false" class="credential-input">
+          <button id="btn-copy-api-key" class="btn-copy" type="button">Copy</button>
+        </div>
+      </div>
+
+      <button id="btn-confirm-credentials" type="button" style="width:100%;">I Have Saved This Key</button>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

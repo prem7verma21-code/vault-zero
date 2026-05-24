@@ -1,0 +1,9 @@
+{
+  "name": "vault-zero",
+  "version": "0.1.0",
+  "description": "Local-first AI agent identity and permission gateway",
+  "private": true,
+  "scripts": {
+    "start": "cd frontend && npm start"
+  }
+}

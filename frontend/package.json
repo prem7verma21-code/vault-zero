@@ -1,0 +1,13 @@
+{
+  "name": "vault-zero-frontend",
+  "version": "0.1.0",
+  "description": "Electron shell for Vault-Zero — UI only, zero backend logic",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}

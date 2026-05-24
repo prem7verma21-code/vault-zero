@@ -1,0 +1,12 @@
+# All Python dependencies for Vault-Zero backend.
+fastapi
+uvicorn[standard]
+sqlcipher3
+cryptography
+argon2-cffi
+python-jose[cryptography]
+slowapi
+msgpack
+websockets
+psutil
+nuitka
