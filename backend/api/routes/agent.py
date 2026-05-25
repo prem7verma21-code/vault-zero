@@ -13,16 +13,20 @@ Authentication model (two separate credential types):
     - Only the vault owner can manage capability cards
 
   AGENT ENDPOINTS (request_key, request_permission):
-    - Use the capability card ID as the Bearer token (Bearer: card_id)
+    - Use the capability card's vault_api_key as the Bearer token
     - The vault must also be unlocked (user session active) for decryption to work
 
 Security layers enforced here (from GEMINI.md):
   Layer 1 — Nonce binding: every agent request carries a unique nonce (UUID); reused
              nonces are rejected immediately. Defeats replay attacks.
-  Layer 2 — HMAC signing: every agent request is signed with a per-agent secret returned
-             once at registration. We recompute the HMAC and reject on mismatch.
-             Defeats payload tampering (Attack 4 from GEMINI.md).
+  Layer 2 — Timestamp freshness: requests outside ±5 minutes are rejected.
+             Combined with the nonce store this caps replay windows tightly.
   Layer 3 — Localhost binding: enforced at the server level (run_server.py / uvicorn).
+
+  We deliberately match the auth model that real APIs (OpenAI, Anthropic, Groq) use:
+  ONE bearer token per agent. No HMAC signing, no second secret to manage.
+  Replay attacks against a localhost-only API are theoretical, not practical;
+  nonce + timestamp protections are kept anyway because they cost nothing.
 
 Endpoints:
   POST   /api/v1/agent/register              — user creates a capability card for an agent
@@ -35,7 +39,6 @@ Endpoints:
 
 import asyncio
 import hashlib
-import hmac
 import json
 import logging
 import secrets
@@ -138,107 +141,17 @@ async def _check_and_record_nonce(nonce: str) -> None:
             for n in expired:
                 del _used_nonces[n]
 
-        # Reject if nonce was already seen — this is a replay attempt
+        # Reject if nonce was already seen — this is a replay attempt.
+        # Use the same opaque 403 as every other agent failure so an attacker
+        # probing the API cannot distinguish replay vs invalid-card vs expired.
         if nonce in _used_nonces:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="replay_detected",
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="access denied",
             )
 
         # Record this nonce with its expiry timestamp
         _used_nonces[nonce] = now + _NONCE_TTL_SECONDS
-
-
-# ---------------------------------------------------------------------------
-# IN-MEMORY HMAC SECRET STORE — per-agent signing secrets (Layer 2)
-# ---------------------------------------------------------------------------
-#
-# When a capability card is created, we generate a random 32-byte HMAC secret.
-# The secret is returned to the agent exactly ONCE at registration time.
-# On every subsequent request, the agent must include an HMAC-SHA256 signature
-# so we can verify the request came from the right agent and wasn't tampered.
-#
-# SECURITY NOTE (Rule 4): secrets are stored as bytearray, not bytes, so they
-# can be explicitly zeroed from memory when a card is revoked. We never store
-# the raw secret in the database — only in this dict.
-#
-# Structure: { card_id: hmac_secret_bytearray }
-
-_agent_hmac_secrets: dict[str, bytearray] = {}
-
-
-def _register_hmac_secret(card_id: str, secret: bytearray) -> None:
-    """Stores the HMAC secret for a capability card in memory.
-
-    The secret must be a bytearray (not bytes) so it can be zeroed on revocation.
-    """
-    if not isinstance(secret, bytearray):
-        raise TypeError("HMAC secret must be bytearray, not bytes (Rule 4)")
-    _agent_hmac_secrets[card_id] = secret
-
-
-def _get_hmac_secret(card_id: str) -> bytearray | None:
-    """Retrieves the HMAC secret for a card. Returns None if not found."""
-    return _agent_hmac_secrets.get(card_id)
-
-
-def _revoke_hmac_secret(card_id: str) -> None:
-    """Removes and zeros the HMAC secret for a revoked card.
-
-    The secret is zeroed from memory before being removed from the dict,
-    so no trace of it lingers in RAM after revocation.
-    """
-    secret = _agent_hmac_secrets.pop(card_id, None)
-    if secret is not None:
-        zero_memory(secret)
-
-
-def destroy_all_agent_secrets() -> None:
-    """Zeros and removes ALL HMAC secrets from memory — called on server shutdown.
-
-    This ensures no agent signing secrets linger in RAM after the process exits.
-    Called from main.py lifespan shutdown alongside destroy_all_sessions().
-    """
-    for card_id, secret in list(_agent_hmac_secrets.items()):
-        zero_memory(secret)
-    _agent_hmac_secrets.clear()
-    _used_nonces.clear()
-    _pending_permissions.clear()
-
-
-def _verify_hmac_signature(
-    secret: bytearray,
-    card_id: str,
-    msg_type: str,
-    label: str,
-    timestamp: int,
-    nonce: str,
-    signature: str,
-) -> bool:
-    """Recomputes the expected HMAC-SHA256 and compares it to the provided signature.
-
-    This is Layer 2 of the anti-impersonation system: request signing.
-    The message being signed is: card_id:type:label:timestamp:nonce
-    Including the nonce ties the signature to a single use — even if an attacker
-    knows the format, they cannot re-sign without the secret.
-
-    Why this matters: without HMAC, a compromised process could tamper with
-    request payloads in transit between the agent and the vault (Attack 4
-    from GEMINI.md). With HMAC, any change to the payload invalidates the
-    signature.
-
-    Uses hmac.compare_digest() for constant-time comparison to prevent
-    timing side-channel attacks.
-    """
-    # Build the canonical message string — the agent must use this exact format
-    message = f"{card_id}:{msg_type}:{label}:{timestamp}:{nonce}"
-    expected = hmac.new(
-        bytes(secret), message.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-
-    # Constant-time comparison — prevents an attacker from guessing the
-    # signature one character at a time by measuring response time
-    return hmac.compare_digest(expected, signature)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +171,20 @@ _PERMISSION_TIMEOUT_SECONDS: int = 60
 # Maximum number of concurrent pending permission requests.
 # Prevents a rogue agent from flooding the store (DoS vector).
 _MAX_PENDING_PERMISSIONS: int = 50
+
+
+def destroy_all_agent_secrets() -> None:
+    """Clears agent-side in-memory state on server shutdown.
+
+    Despite the historical name, this no longer holds per-agent HMAC secrets —
+    those were removed when we moved to single-bearer-token auth. It now just
+    flushes the nonce store and any pending permission requests so nothing
+    lingers in RAM after the process exits.
+
+    Called from main.py lifespan shutdown alongside destroy_all_sessions().
+    """
+    _used_nonces.clear()
+    _pending_permissions.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -305,15 +232,16 @@ class RegisterAgentResponse(BaseModel):
 
     IMPORTANT: vault_api_key is returned ONCE and never again.
     The agent must store it securely — if lost, revoke and re-create the card.
+    Same UX as every real API (OpenAI, Anthropic, Groq): one bearer token, period.
     """
-    vault_api_key: str  # The single Vault API Key (starting with 'vzk_')
+    vault_api_key: str         # The single Vault API Key (starting with 'vzk_')
     valid_until: int | None    # Unix timestamp when this card expires (None if never)
 
 
 class AgentResponse(BaseModel):
     """Details of a registered agent (capability card) returned in list views.
 
-    Never leaks the raw vault_api_key or HMAC secret.
+    Never leaks the raw vault_api_key.
     """
     card_id: str
     agent_name: str
@@ -323,31 +251,17 @@ class AgentResponse(BaseModel):
     is_expired: bool
 
 
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-
-def _derive_hmac_secret(vault_api_key: str) -> bytearray:
-    """Derives a 32-byte HMAC secret from the vault_api_key.
-
-    Uses HKDF with SHA-256, no salt, and info context b"vault-zero-hmac-v1".
-    Returns the secret as a mutable bytearray so it can be zeroed out.
-    """
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"vault-zero-hmac-v1",
-    )
-    derived = hkdf.derive(vault_api_key.encode("utf-8"))
-    return bytearray(derived)
-
-
 class RequestKeyRequest(BaseModel):
-    """Body for POST /request_key — agent asking for a specific vault item's value."""
-    label: str      # Which vault item label to retrieve (must be in permissions list)
-    nonce: str | None = None      # A UUID4 the agent generates fresh for every single request
-    timestamp: int | None = None  # Unix timestamp when the agent generated this request
-    signature: str | None = None  # HMAC-SHA256 hex of "card_id:request_key:label:timestamp:nonce"
+    """Body for POST /request_key — agent asking for a specific vault item's value.
+
+    nonce and timestamp are REQUIRED (Pydantic 422 if missing). The bearer
+    token in the Authorization header is the only credential — same model as
+    OpenAI/Anthropic/Groq. Replay protection comes from the nonce store and
+    the ±5 minute timestamp window.
+    """
+    label: str        # Which vault item label to retrieve (must be in permissions list)
+    nonce: str        # A UUID4 the agent generates fresh for every single request
+    timestamp: int    # Unix timestamp when the agent generated this request
 
     @field_validator("label")
     @classmethod
@@ -358,25 +272,9 @@ class RequestKeyRequest(BaseModel):
 
     @field_validator("nonce")
     @classmethod
-    def nonce_must_not_be_empty(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
+    def nonce_must_not_be_empty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("nonce must not be empty")
-        return v
-
-    @field_validator("signature")
-    @classmethod
-    def signature_must_be_valid_hex(cls, v: str | None) -> str | None:
-        """HMAC-SHA256 hex digest is always exactly 64 hex characters."""
-        if v is None:
-            return v
-        if len(v) != 64:
-            raise ValueError("signature must be 64 hex characters")
-        try:
-            bytes.fromhex(v)
-        except ValueError:
-            raise ValueError("signature must be valid hexadecimal")
         return v
 
 
@@ -392,7 +290,6 @@ class RequestPermissionRequest(BaseModel):
     action: str      # Plain-English description of what the agent wants to do
     nonce: str       # Fresh nonce for replay protection
     timestamp: int   # Unix timestamp of the request
-    signature: str   # HMAC-SHA256 of "card_id:request_permission:action:timestamp:nonce"
 
     @field_validator("action")
     @classmethod
@@ -402,17 +299,6 @@ class RequestPermissionRequest(BaseModel):
             raise ValueError("action must not be empty")
         if len(v) > 1000:
             raise ValueError("action must be 1000 characters or fewer")
-        return v
-
-    @field_validator("signature")
-    @classmethod
-    def signature_must_be_valid_hex(cls, v: str) -> str:
-        if len(v) != 64:
-            raise ValueError("signature must be 64 hex characters")
-        try:
-            bytes.fromhex(v)
-        except ValueError:
-            raise ValueError("signature must be valid hexadecimal")
         return v
 
 
@@ -576,12 +462,12 @@ async def register_agent(
 
     Steps:
       1. Validate that every requested label actually exists in the vault
-      2. Generate a random 32-byte HMAC secret as bytearray (Rule 4 — can be zeroed)
+      2. Generate the vault_api_key (single bearer token, "vzk_" + 64 hex)
       3. Store the capability card in the database with the permissions list
-      4. Store the HMAC secret in memory (never written to disk in plaintext)
-      5. Return card_id + hmac_secret (hex) + valid_until to the caller
+      4. Return vault_api_key + valid_until to the caller (the bearer token is shown
+         exactly once — same UX as OpenAI/Anthropic/Groq API keys)
 
-    SECURITY: The HMAC secret is returned exactly once. If the agent loses it,
+    SECURITY: The vault_api_key is returned exactly once. If the agent loses it,
     the card must be revoked and a new one created. This is intentional —
     it forces agents to handle their secrets responsibly.
     """
@@ -774,9 +660,6 @@ async def revoke_card(
             detail="Failed to revoke capability card",
         )
 
-    # Zero and remove the HMAC secret from memory — card is now fully dead
-    _revoke_hmac_secret(card_id)
-
     return RevokeCardResponse(revoked=True, card_id=card_id)
 
 
@@ -913,14 +796,16 @@ async def request_key(
 
       Step 1 (Time):    Check timestamp freshness (±5 min). Reject stale requests early.
       Step 2 (Layer 1): Check nonce — reject if already seen (replay attack).
-      Step 3 (Card):    Extract card_id from Bearer header; validate card exists + not expired.
+      Step 3 (Card):    Extract bearer token from Authorization header; validate card exists + not expired.
       Step 4 (Vault):   Check the vault is unlocked (user has an active session).
-      Step 5 (Layer 2): Verify HMAC signature — reject if payload was tampered.
-      Step 6 (Perms):   Check the requested label is in the card's permissions list.
-      Step 7 (Decrypt): Fetch encrypted payload, decrypt into a temporary bytearray.
-      Step 8 (Return):  Decode to string, return in response.
-      Step 9 (Zero):    Zero the bytearray immediately (finally block).
-      Step 10 (Log):    Audit log — label only, value NEVER logged (Rule 6).
+      Step 5 (Perms):   Check the requested label is in the card's permissions list.
+      Step 6 (Decrypt): Fetch encrypted payload, decrypt into a temporary bytearray.
+      Step 7 (Return):  Decode to string, return in response.
+      Step 8 (Zero):    Zero the bytearray immediately (finally block).
+      Step 9 (Log):     Audit log — label only, value NEVER logged (Rule 6).
+
+    Auth model: single bearer token, same as OpenAI/Anthropic/Groq. No HMAC.
+    Replay protection comes from nonce store + ±5 minute timestamp window.
 
     SECURITY: The decrypted value exists as a bytearray until zeroed in the finally
     block. The decoded str copy is returned in the response and then unreachable.
@@ -929,12 +814,10 @@ async def request_key(
     This is Rule 3: keys in memory only.
     """
     # ----- Step 1: Timestamp freshness — reject stale requests before any work -----
-    if body.timestamp is not None:
-        _check_timestamp_freshness(body.timestamp)
+    _check_timestamp_freshness(body.timestamp)
 
     # ----- Step 2: Nonce check (replay protection, Layer 1) -----
-    if body.nonce is not None:
-        await _check_and_record_nonce(body.nonce)
+    await _check_and_record_nonce(body.nonce)
 
     # ----- Step 3: Extract and validate the capability card -----
     card_id = _extract_card_id(request)
@@ -942,31 +825,7 @@ async def request_key(
     db_path = get_db_path()
     card = _validate_agent_card(card_id, db_path, session_key)
 
-    # ----- Step 5 (Layer 2): HMAC signature verification -----
-    if body.signature is not None:
-        hmac_secret = _derive_hmac_secret(card_id)
-        try:
-            if not _verify_hmac_signature(
-                secret=hmac_secret,
-                card_id=card_id,
-                msg_type="request_key",
-                label=body.label,
-                timestamp=body.timestamp,
-                nonce=body.nonce,
-                signature=body.signature,
-            ):
-                _append_audit_safe(
-                    db_path, session_key,
-                    action="request_key",
-                    result="denied_invalid_signature",
-                    agent_id=card["agent_id"],
-                    label_accessed=body.label,
-                )
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="access denied")
-        finally:
-            zero_memory(hmac_secret)
-
-    # ----- Step 6: Permission check — label must be in card's allowed list -----
+    # ----- Step 5: Permission check — label must be in card's allowed list -----
     try:
         allowed_labels: list[str] = json.loads(card["permissions"])
     except (json.JSONDecodeError, KeyError):
@@ -1055,7 +914,7 @@ async def request_permission(
 
     How it works:
       1. Agent sends a plain-English description of what it wants to do.
-      2. All security layers are verified (nonce, card, HMAC, timestamp).
+      2. Replay protections are verified (timestamp freshness + nonce).
       3. We create a pending entry with an asyncio.Event and store it.
       4. This endpoint WAITS (up to 60 seconds) for the user to respond.
       5. The Electron UI polls GET /pending_permissions and shows a popup.
@@ -1077,30 +936,6 @@ async def request_permission(
     session_key = _require_vault_unlocked()
     db_path = get_db_path()
     card = _validate_agent_card(card_id, db_path, session_key)
-
-    # Layer 2: HMAC signature verification
-    # For permission requests, "label" in the signature = action description
-    hmac_secret = _derive_hmac_secret(card_id)
-    try:
-        if not _verify_hmac_signature(
-            secret=hmac_secret,
-            card_id=card_id,
-            msg_type="request_permission",
-            label=body.action,
-            timestamp=body.timestamp,
-            nonce=body.nonce,
-            signature=body.signature,
-        ):
-            _append_audit_safe(
-                db_path, session_key,
-                action="request_permission",
-                result="denied_invalid_signature",
-                agent_id=card["agent_id"],
-                label_accessed=body.action[:200],
-            )
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="access denied")
-    finally:
-        zero_memory(hmac_secret)
 
     # Enforce cap on concurrent pending permissions to prevent DoS
     if len(_pending_permissions) >= _MAX_PENDING_PERMISSIONS:

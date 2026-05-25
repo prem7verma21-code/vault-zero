@@ -11,6 +11,9 @@ Add to your .env file:
 VZK_KEY=vzk_your_key_here
 ```
 
+The key is returned **once** at registration. Save it immediately — if it's lost,
+revoke the card and register again.
+
 ## Usage
 ```python
 from vaultzero import get

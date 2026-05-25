@@ -30,7 +30,7 @@ Message types:
 
 Security layers enforced (same as REST API):
   Layer 1 — Nonce binding:   every request has a unique nonce; replays are rejected
-  Layer 2 — HMAC signing:    every request is signed; tampering is detected
+  Layer 2 — Timestamp window: requests outside ±5 minutes are rejected
   Layer 3 — Localhost:       server binds to 127.0.0.1 only (enforced here and in run_server.py)
   Process pinning:           background task monitors parent (Electron) process health
 
@@ -70,11 +70,9 @@ from backend.database.models import (
 
 # Import agent.py's security infrastructure — same layers used by the REST API.
 # Because both servers run in the same Python process, they share the same
-# module-level state (nonce store, HMAC secrets, pending permissions).
+# module-level state (nonce store, pending permissions).
 from backend.api.routes.agent import (
     _check_and_record_nonce,
-    _verify_hmac_signature,
-    _derive_hmac_secret,
     _validate_agent_card,
     _append_audit_safe,
     _pending_permissions,
@@ -229,7 +227,6 @@ async def _handle_handshake(ws) -> tuple[str | None, dict | None]:
     # Validate the capability card — this checks:
     #   - Card exists in the database
     #   - Card is not expired (valid_until > now)
-    #   - HMAC secret exists in memory (card was registered this session)
     # On failure, _validate_agent_card raises HTTPException.
     db_path = get_db_path()
     try:
@@ -279,9 +276,10 @@ async def _handle_key_request(
 
       Step 1: Timestamp freshness (±5 minutes)
       Step 2: Nonce uniqueness (replay protection — Layer 1)
-      Step 3: HMAC signature verification (tampering protection — Layer 2)
-      Step 4: Permission check (label must be in card's allowed list)
-      Step 5: Decrypt vault item → return value → zero memory
+      Step 3: Permission check (label must be in card's allowed list)
+      Step 4: Decrypt vault item → return value → zero memory
+
+    Auth model: bearer token only (same as the REST API). No HMAC.
 
     On ANY failure: returns {"type": "error", "reason": "access denied"}.
     Never reveals which specific check failed.
@@ -289,7 +287,6 @@ async def _handle_key_request(
     label = payload.get("label", "")
     nonce = payload.get("nonce", "")
     timestamp = payload.get("timestamp", 0)
-    signature = payload.get("signature", "")
     db_path = get_db_path()
 
     # --- Step 1: Timestamp freshness ---
@@ -308,27 +305,7 @@ async def _handle_key_request(
     except Exception:
         return {"type": "error", "msg_id": msg_id, "reason": "access denied"}
 
-    # --- Step 3: HMAC signature verification (Layer 2 — tampering protection) ---
-    hmac_secret = _derive_hmac_secret(card_id)
-    try:
-        if not _verify_hmac_signature(
-            secret=hmac_secret,
-            card_id=card_id,
-            msg_type="request_key",
-            label=label,
-            timestamp=timestamp,
-            nonce=nonce,
-            signature=signature,
-        ):
-            _append_audit_safe(
-                db_path, session_key, "tunnel_request_key",
-                "denied_invalid_signature", agent_id, label,
-            )
-            return {"type": "error", "msg_id": msg_id, "reason": "access denied"}
-    finally:
-        zero_memory(hmac_secret)
-
-    # --- Step 4: Permission check ---
+    # --- Step 3: Permission check ---
     try:
         allowed_labels: list[str] = json.loads(card["permissions"])
     except (json.JSONDecodeError, KeyError):
@@ -403,7 +380,7 @@ async def _handle_permission_request(
 
     How it works:
       1. Agent sends a description of what it wants to do
-      2. All security layers are verified (timestamp, nonce, HMAC)
+      2. Replay protections verified (timestamp ±5 min + fresh nonce)
       3. A pending entry is created with an asyncio.Event
       4. This handler WAITS (up to 60 seconds) for the user to respond
       5. The Electron UI polls GET /pending_permissions (REST) and shows a popup
@@ -418,7 +395,6 @@ async def _handle_permission_request(
     action = payload.get("action", "")
     nonce = payload.get("nonce", "")
     timestamp = payload.get("timestamp", 0)
-    signature = payload.get("signature", "")
     request_id = payload.get("request_id", str(uuid_mod.uuid4()))
     db_path = get_db_path()
 
@@ -432,26 +408,6 @@ async def _handle_permission_request(
         await _check_and_record_nonce(nonce)
     except Exception:
         return {"type": "error", "msg_id": msg_id, "reason": "access denied"}
-
-    # --- Layer 2: HMAC verification ---
-    hmac_secret = _derive_hmac_secret(card_id)
-    try:
-        if not _verify_hmac_signature(
-            secret=hmac_secret,
-            card_id=card_id,
-            msg_type="request_permission",
-            label=action,
-            timestamp=timestamp,
-            nonce=nonce,
-            signature=signature,
-        ):
-            _append_audit_safe(
-                db_path, session_key, "tunnel_request_permission",
-                "denied_invalid_signature", agent_id, action[:200],
-            )
-            return {"type": "error", "msg_id": msg_id, "reason": "access denied"}
-    finally:
-        zero_memory(hmac_secret)
 
     # --- Prevent flooding ---
     if len(_pending_permissions) >= _MAX_PENDING_PERMISSIONS:
@@ -740,7 +696,7 @@ async def start_tunnel_server(
 
     Called by run_server.py at startup, alongside the REST API server.
     Both servers run in the same Python process and share the same
-    module-level state (sessions, nonces, HMAC secrets, etc.).
+    module-level state (sessions, nonces, pending permissions).
 
     Args:
         host: IP address to bind to. Always 127.0.0.1 — never 0.0.0.0.
@@ -792,7 +748,7 @@ async def start_parent_monitor(parent_pid: int) -> None:
     This task verifies the parent is still running. If it dies (user closes the app,
     crash, kill), we immediately:
       1. Zero all derived keys from memory
-      2. Zero all HMAC secrets from memory
+      2. Clear nonce store and pending permissions
       3. Force-exit the process (os._exit)
 
     This prevents an orphaned vault process from running with live keys in RAM

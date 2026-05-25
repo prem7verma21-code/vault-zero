@@ -11,11 +11,13 @@ Tests:
 Each test:
   - Creates an isolated temporary SQLCipher database
   - Unlocks the vault with a test password (stores session key)
-  - Registers an agent via the REST API to get a valid card_id + HMAC secret
+  - Inserts a capability card directly so the tunnel can authenticate the agent
   - Adds a vault item for key_request tests
   - Starts the WebSocket tunnel server on a random port
   - Connects with the `websockets` library and exercises the protocol
   - Tears everything down cleanly
+
+Auth model: single bearer token (vault_api_key) — same as the REST API.
 
 SECURITY NOTE: These tests use the REAL crypto stack (AES-256-GCM + Argon2id).
 No crypto is mocked. This verifies the tunnel works end-to-end with production
@@ -25,7 +27,6 @@ encryption, exactly as it will run in the real app.
 import asyncio
 import gc
 import hashlib
-import hmac as hmac_mod
 import json
 import os
 import time
@@ -45,9 +46,7 @@ from backend.database.models import (
     insert_vault_item,
 )
 from backend.api.routes.agent import (
-    _register_hmac_secret,
     _used_nonces,
-    _agent_hmac_secrets,
     _pending_permissions,
     destroy_all_agent_secrets,
 )
@@ -70,23 +69,6 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
-
-def _sign_request(
-    hmac_secret_hex: str,
-    card_id: str,
-    msg_type: str,
-    label: str,
-    timestamp: int,
-    nonce: str,
-) -> str:
-    """Produces the HMAC-SHA256 signature matching agent.py's _verify_hmac_signature().
-
-    Message format: card_id:type:label:timestamp:nonce
-    """
-    secret = bytes.fromhex(hmac_secret_hex)
-    message = f"{card_id}:{msg_type}:{label}:{timestamp}:{nonce}"
-    return hmac_mod.new(secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
-
 
 def _encrypt_outbound(message: dict, session_key: bytearray) -> bytes:
     """Encrypts a message dict for sending to the tunnel server (client side).
@@ -171,7 +153,6 @@ def unlocked_vault(temp_db, monkeypatch):
 
     # Clear any leftover in-memory state from previous tests
     _used_nonces.clear()
-    _agent_hmac_secrets.clear()
     _pending_permissions.clear()
 
     # Create a session so get_any_session_key() returns our key
@@ -201,10 +182,11 @@ def vault_with_item(unlocked_vault):
 
 @pytest.fixture()
 def registered_agent(vault_with_item):
-    """Registers an agent with permission to access the test vault item.
+    """Inserts a capability card directly into the test DB.
 
-    Creates the capability card directly in the database — exactly what
-    the REST /register endpoint does.
+    Mirrors what the REST /register endpoint does, minus the HMAC secret —
+    the tunnel uses single-bearer-token auth with nonce + timestamp for
+    replay protection.
     """
     db_path, key, session_token, item_id = vault_with_item
 
@@ -212,13 +194,6 @@ def registered_agent(vault_with_item):
     import secrets
     vault_api_key = "vzk_" + secrets.token_hex(32)
     hashed_key = hashlib.sha256(vault_api_key.encode("utf-8")).hexdigest()
-
-    # Derive the HMAC secret server-side from vault_api_key
-    from backend.api.routes.agent import _derive_hmac_secret
-    from backend.core.crypto import zero_memory
-    hmac_secret = _derive_hmac_secret(vault_api_key)
-    hmac_secret_hex = hmac_secret.hex()
-    zero_memory(hmac_secret)
 
     # Permissions: JSON array of allowed labels
     permissions_json = json.dumps([TEST_LABEL])
@@ -238,8 +213,7 @@ def registered_agent(vault_with_item):
         "key": key,
         "session_token": session_token,
         "item_id": item_id,
-        "card_id": vault_api_key,  # The tests expect "card_id" to be the token they send in handshake/signing
-        "hmac_secret_hex": hmac_secret_hex,
+        "card_id": vault_api_key,  # Tests send this raw token in handshake/payloads
         "valid_until": valid_until,
     }
 
@@ -309,17 +283,15 @@ async def test_tunnel_handshake(tunnel_server):
 async def test_tunnel_key_request_valid(tunnel_server):
     """Test 2: Send key_request for a permitted label → receive decrypted value.
 
-    Full security chain is exercised:
+    Full security chain:
       - Timestamp freshness (±5 minutes)
-      - Nonce uniqueness (Layer 1)
-      - HMAC signature verification (Layer 2)
+      - Nonce uniqueness (replay protection)
       - Permission check (label in card's allowed list)
       - Decryption of vault item → plaintext returned
     """
     port, agent_info = tunnel_server
     card_id = agent_info["card_id"]
     key = agent_info["key"]
-    hmac_secret_hex = agent_info["hmac_secret_hex"]
 
     uri = f"ws://127.0.0.1:{port}/agent"
 
@@ -335,20 +307,13 @@ async def test_tunnel_key_request_valid(tunnel_server):
         assert confirm_msg["type"] == "connected"
 
         # --- key_request ---
-        nonce = str(uuid.uuid4())
-        timestamp = int(time.time())
-        signature = _sign_request(
-            hmac_secret_hex, card_id, "request_key", TEST_LABEL, timestamp, nonce,
-        )
-
         request_msg = {
             "type": "key_request",
             "msg_id": str(uuid.uuid4()),
             "payload": {
                 "label": TEST_LABEL,
-                "nonce": nonce,
-                "timestamp": timestamp,
-                "signature": signature,
+                "nonce": str(uuid.uuid4()),
+                "timestamp": int(time.time()),
             },
         }
 
@@ -382,7 +347,6 @@ async def test_tunnel_key_request_invalid_label(tunnel_server):
     port, agent_info = tunnel_server
     card_id = agent_info["card_id"]
     key = agent_info["key"]
-    hmac_secret_hex = agent_info["hmac_secret_hex"]
 
     uri = f"ws://127.0.0.1:{port}/agent"
 
@@ -399,20 +363,13 @@ async def test_tunnel_key_request_invalid_label(tunnel_server):
 
         # --- key_request for a label the agent does NOT have permission for ---
         wrong_label = "Non-Existent Key"
-        nonce = str(uuid.uuid4())
-        timestamp = int(time.time())
-        signature = _sign_request(
-            hmac_secret_hex, card_id, "request_key", wrong_label, timestamp, nonce,
-        )
-
         request_msg = {
             "type": "key_request",
             "msg_id": str(uuid.uuid4()),
             "payload": {
                 "label": wrong_label,
-                "nonce": nonce,
-                "timestamp": timestamp,
-                "signature": signature,
+                "nonce": str(uuid.uuid4()),
+                "timestamp": int(time.time()),
             },
         }
 

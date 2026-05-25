@@ -17,10 +17,11 @@ import base64
 import json
 import os
 import secrets
+import shutil
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
@@ -57,6 +58,20 @@ bearer_scheme = HTTPBearer(auto_error=False)
 class UnlockRequest(BaseModel):
     """Body for the unlock endpoint — the master password."""
     password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        """Reject empty / single-char passwords up front (Bug 3 fix).
+
+        Setup already enforces a minimum of 8 chars; mirroring it here
+        means an attacker can't even start a derive_key cycle for an
+        obviously-too-short input. Returns 422 via Pydantic before the
+        rate limiter sees the request.
+        """
+        if len(v) < 8:
+            raise ValueError("password must be at least 8 characters")
+        return v
 
 
 class UnlockResponse(BaseModel):
@@ -429,6 +444,16 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
             set_setting(conn, "master_password_hash", pw_hash)
             set_setting(conn, "recovery_code_hash", rc_hash)
 
+        # Bug 1 fix — also write the recovery code hash to a side-file so /recover
+        # can verify the supplied code BEFORE opening the SQLCipher database. This
+        # closes a timing oracle: previously, the DB was opened (Argon2id key
+        # derivation + sqlcipher open) prior to the Argon2id hash check, so wrong
+        # codes took noticeably longer to fail than malformed ones. Argon2id
+        # hashes aren't reversible, so storing the hash next to the DB is safe.
+        recovery_hash_path = str(Path(db_path).with_suffix(".recovery.hash"))
+        with open(recovery_hash_path, "w") as f:
+            f.write(rc_hash)
+
         # Open a session — same mechanism as /unlock
         token = create_session(key)
         # recovery_code is returned to the caller once and never stored raw
@@ -468,15 +493,19 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
 
     Steps:
       1. Validate new_password length >= 8
-      2. Load recovery_salt, derive recovery_key = Argon2id(recovery_code, recovery_salt)
-      3. Open DB with recovery_key; verify recovery_code_hash matches; load key_bundle
+      2. Verify the recovery code's Argon2id hash against the side-file BEFORE
+         opening the SQLCipher database (Bug 1 — closes timing oracle)
+      3. Load recovery_salt, derive recovery_key = Argon2id(recovery_code, recovery_salt)
       4. Decrypt key_bundle to get old vault_key
-      5. Open DB with old vault_key; read all vault items
+      5. Copy DB to temp; open temp with old_key; verify recovery_code_hash
+         (defense-in-depth); read all vault items
       6. Decrypt all items with old vault_key
       7. Derive new vault_key from new_password (fresh salt)
       8. Re-encrypt all items with new vault_key
-      9. In a raw SQLCipher connection: update all rows, update settings, PRAGMA rekey
-      10. Write new salts, create new session, return new recovery code
+      9. On the temp DB only: update all rows, update settings, PRAGMA rekey
+     10. Verify the rekeyed temp DB opens cleanly with new_key
+     11. os.replace(temp, db_path) — atomic swap (Bug 2 — no half-rekeyed file)
+     12. Write new companion files; create new session; return new recovery code
     """
     if len(body.new_password) < 8:
         raise HTTPException(
@@ -488,12 +517,32 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
     salt_path = str(Path(db_path).with_suffix(".salt"))
     recovery_salt_path = str(Path(db_path).with_suffix(".recovery.salt"))
     keyblob_path = str(Path(db_path).with_suffix(".keyblob"))
+    recovery_hash_path = str(Path(db_path).with_suffix(".recovery.hash"))
 
     if not Path(db_path).exists() or not Path(recovery_salt_path).exists() or not Path(keyblob_path).exists():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_recovery_code",
         )
+
+    # Bug 1 fix — verify the Argon2id hash from the side-file BEFORE we touch
+    # SQLCipher. The previous flow opened the DB (Argon2id key derivation +
+    # sqlcipher_open) before the hash check, leaking timing information about
+    # which step rejected. We still re-check inside the DB later as defense-in-depth.
+    if Path(recovery_hash_path).exists():
+        try:
+            with open(recovery_hash_path, "r") as f:
+                side_hash = f.read().strip()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_recovery_code",
+            )
+        if not verify_password(body.recovery_code, side_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_recovery_code",
+            )
 
     try:
         with open(recovery_salt_path, "rb") as f:
@@ -511,6 +560,9 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
     new_key = None
     decrypted_items: list[tuple[str, str, str, bytes]] = []
 
+    # Temp DB path lives next to the real one; os.replace is atomic on the same volume.
+    temp_db_path = db_path + ".rekey.tmp"
+
     try:
         # Derive the recovery key from the provided recovery code + stored recovery salt
         recovery_key, _ = derive_key(body.recovery_code, recovery_salt)
@@ -526,10 +578,24 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
                 detail="invalid_recovery_code",
             )
 
-        # Open the DB with the recovered vault key to verify the recovery_code hash
-        # and read all vault items
+        # Bug 2 fix — work on a copy so an interrupted rekey can't corrupt the
+        # live vault. copy2 preserves the SQLCipher header.
         try:
-            with get_connection(db_path, old_key) as conn:
+            shutil.copy2(db_path, temp_db_path)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                "Recovery: temp copy failed: %s", type(exc).__name__
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="recovery_failed",
+            )
+
+        # Open the temp DB with the recovered vault key to verify the recovery_code
+        # hash (defense-in-depth) and read all vault items
+        try:
+            with get_connection(temp_db_path, old_key) as conn:
                 stored_rc_hash = get_setting(conn, "recovery_code_hash")
                 rows = conn.execute(
                     "SELECT id, category, label, encrypted_payload FROM vault_items"
@@ -540,7 +606,9 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
                 detail="invalid_recovery_code",
             )
 
-        # Second verification: Argon2id hash check on the recovery code string itself
+        # Defense-in-depth: re-verify the Argon2id hash inside the DB itself.
+        # Catches the case where someone tampered with the side-file but not
+        # the encrypted vault_settings row.
         if stored_rc_hash is None or not verify_password(body.recovery_code, stored_rc_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -575,12 +643,14 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
         new_pw_hash = hash_password(body.new_password)
         new_rc_hash = hash_password(new_recovery_code)
 
-        # Re-key the SQLCipher database file in-place using PRAGMA rekey.
-        # We open with the OLD vault key and apply the new vault key atomically.
+        # Re-key the TEMP database file using PRAGMA rekey. The original is
+        # untouched until we os.replace at the end. If we crash anywhere in
+        # this block, the temp file is removed and the user can still recover
+        # by re-running with the same code.
         try:
             from sqlcipher3 import dbapi2 as sqlcipher
 
-            conn_raw = sqlcipher.connect(db_path)
+            conn_raw = sqlcipher.connect(temp_db_path)
             old_key_hex = bytes(old_key).hex()
             new_key_hex = bytes(new_key).hex()
 
@@ -615,6 +685,14 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
             conn_raw.commit()
             conn_raw.close()
 
+            # Verify by opening the rekeyed temp file fresh with the new key.
+            # If this round-trip fails, the rekey didn't actually take and we
+            # must NOT replace the original.
+            with get_connection(temp_db_path, new_key) as verify_conn:
+                verify_hash = get_setting(verify_conn, "master_password_hash")
+            if verify_hash != new_pw_hash:
+                raise RuntimeError("rekey verification mismatch")
+
         except Exception as exc:
             import logging
             logging.getLogger(__name__).error(
@@ -625,19 +703,42 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
                 detail="recovery_failed",
             )
 
-        # Overwrite all three companion files with the new values
+        # The temp DB is now rekeyed and verified. Atomic swap into place.
+        try:
+            os.replace(temp_db_path, db_path)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                "Recovery: atomic replace failed: %s", type(exc).__name__
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="recovery_failed",
+            )
+
+        # Overwrite companion files. Order: salt first (needed for any future
+        # /unlock), then keyblob, then recovery salt + recovery hash.
         with open(salt_path, "wb") as f:
             f.write(new_salt)
-        with open(recovery_salt_path, "wb") as f:
-            f.write(new_recovery_salt)
         with open(keyblob_path, "w") as f:
             f.write(json.dumps(new_key_bundle))
+        with open(recovery_salt_path, "wb") as f:
+            f.write(new_recovery_salt)
+        with open(recovery_hash_path, "w") as f:
+            f.write(new_rc_hash)
 
         # Open a new session under the new key
         token = create_session(new_key)
         return RecoverResponse(session_token=token, new_recovery_code=new_recovery_code)
 
     finally:
+        # Clean up the temp file in any failure path. os.replace already
+        # consumed it on the success path, so missing-file is fine.
+        if Path(temp_db_path).exists():
+            try:
+                os.remove(temp_db_path)
+            except Exception:
+                pass
         if recovery_key is not None:
             zero_memory(recovery_key)
         if old_key is not None:

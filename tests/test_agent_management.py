@@ -1,11 +1,10 @@
 """
 Tests for agent management (list and revoke endpoints) — Step 1.11.
+Single bearer token auth (no HMAC).
 """
 
 import gc
 import hashlib
-import hmac
-import json
 import os
 import time
 import uuid
@@ -29,24 +28,16 @@ def _make_agent_headers(vault_api_key: str) -> dict:
     return {"Authorization": f"Bearer {vault_api_key}"}
 
 
-def _sign_request(
-    vault_api_key: str,
-    msg_type: str,
-    label: str,
-    timestamp: int,
-    nonce: str,
-) -> str:
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives import hashes
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"vault-zero-hmac-v1",
-    )
-    secret = hkdf.derive(vault_api_key.encode("utf-8"))
-    message = f"{vault_api_key}:{msg_type}:{label}:{timestamp}:{nonce}"
-    return hmac.new(secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
+def _make_payload(label: str, *, nonce: str | None = None, timestamp: int | None = None) -> dict:
+    """Builds the JSON body an agent sends to /request_key.
+
+    Single bearer token auth — no signing. label + nonce + timestamp.
+    """
+    return {
+        "label": label,
+        "nonce": nonce if nonce is not None else str(uuid.uuid4()),
+        "timestamp": timestamp if timestamp is not None else int(time.time()),
+    }
 
 
 @pytest.fixture()
@@ -83,9 +74,8 @@ def temp_db(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client(temp_db):
-    from backend.api.routes.agent import _used_nonces, _agent_hmac_secrets, _pending_permissions
+    from backend.api.routes.agent import _used_nonces, _pending_permissions
     _used_nonces.clear()
-    _agent_hmac_secrets.clear()
     _pending_permissions.clear()
 
     with TestClient(app) as c:
@@ -205,12 +195,9 @@ def test_revoke_agent_blocks_requests(client, auth_token, vault_item):
     hashed_key = hashlib.sha256(vault_api_key.encode("utf-8")).hexdigest()
 
     # First verify request_key works
-    nonce = str(uuid.uuid4())
-    timestamp = int(time.time())
-    sig = _sign_request(vault_api_key, "request_key", "OpenAI Key", timestamp, nonce)
     resp = client.post(
         "/api/v1/agent/request_key",
-        json={"label": "OpenAI Key", "nonce": nonce, "timestamp": timestamp, "signature": sig},
+        json=_make_payload("OpenAI Key"),
         headers=_make_agent_headers(vault_api_key),
     )
     assert resp.status_code == 200
@@ -220,12 +207,9 @@ def test_revoke_agent_blocks_requests(client, auth_token, vault_item):
     assert revoke_resp.status_code == 200
 
     # Try requesting again — must return 403
-    nonce2 = str(uuid.uuid4())
-    timestamp2 = int(time.time())
-    sig2 = _sign_request(vault_api_key, "request_key", "OpenAI Key", timestamp2, nonce2)
     resp2 = client.post(
         "/api/v1/agent/request_key",
-        json={"label": "OpenAI Key", "nonce": nonce2, "timestamp": timestamp2, "signature": sig2},
+        json=_make_payload("OpenAI Key"),
         headers=_make_agent_headers(vault_api_key),
     )
     assert resp2.status_code == 403
@@ -301,12 +285,9 @@ def test_never_expire_card_request_key_works_after_time_advance(client, auth_tok
     future_time = int(time.time()) + 10 * 365 * 24 * 3600
     monkeypatch.setattr(time, "time", lambda: float(future_time))
 
-    nonce = str(uuid.uuid4())
-    # Request key needs signature and timestamp. Make sure timestamp matches future_time
-    sig = _sign_request(vault_api_key, "request_key", "OpenAI Key", future_time, nonce)
     resp = client.post(
         "/api/v1/agent/request_key",
-        json={"label": "OpenAI Key", "nonce": nonce, "timestamp": future_time, "signature": sig},
+        json=_make_payload("OpenAI Key", timestamp=future_time),
         headers=_make_agent_headers(vault_api_key),
     )
     assert resp.status_code == 200
