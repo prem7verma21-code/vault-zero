@@ -207,6 +207,11 @@ ipcMain.handle('vault:deleteItem', async (event, id) => {
   return await makeRequest('DELETE', `/api/v1/vault/items/${id}`, null, sessionToken);
 });
 
+ipcMain.handle('vault:revealItem', async (event, id) => {
+  if (!sessionToken) throw new Error('Vault is locked');
+  return await makeRequest('POST', `/api/v1/vault/items/${id}/reveal`, null, sessionToken);
+});
+
 ipcMain.handle('vault:respondToPermission', async (event, requestId, approved) => {
   if (!sessionToken) throw new Error('Vault is locked');
   try {

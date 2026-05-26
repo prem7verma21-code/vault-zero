@@ -45,8 +45,11 @@ def temp_db(tmp_path, monkeypatch):
     db_path = str(tmp_path / "vault_mgmt_test.db")
     salt_path = str(Path(db_path).with_suffix(".salt"))
 
-    # Derive a key from the test password
-    key, salt = derive_key(TEST_PASSWORD)
+    # Derive a key using the same device-bound password the API uses, so the
+    # DB this fixture pre-creates can be opened by /unlock with TEST_PASSWORD.
+    from tests.conftest import TEST_DEVICE_FINGERPRINT
+    bound_password = f"{TEST_PASSWORD}:{TEST_DEVICE_FINGERPRINT}"
+    key, salt = derive_key(bound_password)
 
     # Save the salt alongside the database
     with open(salt_path, "wb") as f:

@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('vault', {
   getAudit: () => ipcRenderer.invoke('vault:getAudit'),
   addItem: (item) => ipcRenderer.invoke('vault:addItem', item),
   deleteItem: (id) => ipcRenderer.invoke('vault:deleteItem', id),
+  revealItem: (id) => ipcRenderer.invoke('vault:revealItem', id),
 
   // Permission response from the UI
   respondToPermission: (requestId, approved) =>

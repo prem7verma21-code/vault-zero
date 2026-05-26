@@ -285,3 +285,89 @@ async def test_recover_rotates_keyblob_and_salt(isolated_db):
 
     assert new_keyblob != old_keyblob, ".keyblob must be rotated after recovery"
     assert new_recovery_salt != old_recovery_salt, ".recovery.salt must be rotated after recovery"
+
+
+# ---------------------------------------------------------------------------
+# DEVICE BINDING (Step 1.12)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_unlock_rejects_different_device(isolated_db, monkeypatch):
+    """Copying the vault to another machine must produce a clear 403 device_mismatch.
+
+    Setup runs under the conftest's pinned fingerprint. Then we re-pin the
+    fingerprint to a different value to simulate the vault being copied to a
+    new machine, and assert /unlock rejects it before even hitting the KDF.
+    """
+    req = get_mock_request()
+    await setup(req, SetupRequest(password="OriginalPass1"))
+
+    # The vault was bound to TEST_DEVICE_FINGERPRINT during setup.
+    # Now switch fingerprint as if the files were copied to a different box.
+    different = "different-device-" + "f" * 47  # still 64 chars, not the conftest constant
+    monkeypatch.setattr(
+        "backend.api.routes.auth.get_device_fingerprint",
+        lambda: different,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await unlock(req, UnlockRequest(password="OriginalPass1"))
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "device_mismatch"
+
+
+@pytest.mark.anyio
+async def test_recover_rotates_device_binding(isolated_db, monkeypatch):
+    """Recovery is the deliberate "I'm on a new machine" path.
+
+    Setup on machine A → simulate transferring the files to machine B (no
+    physical copy in the test, just a fingerprint swap) → /unlock fails with
+    device_mismatch → /recover succeeds and rebinds to B → /unlock now works
+    on B with the new password, and an attempt with the *original* fingerprint
+    would now fail (vault is bound to B).
+    """
+    req = get_mock_request()
+    db_path = isolated_db
+    device_hash_path = Path(db_path).with_suffix(".device.hash")
+
+    # Set up on "machine A" (default conftest fingerprint).
+    setup_response = await setup(req, SetupRequest(password="OldPassword1"))
+    old_rc = setup_response.recovery_code
+    a_device_hash = device_hash_path.read_text()
+
+    # Simulate moving the files to "machine B".
+    machine_b = "machine-b-fingerprint-" + "b" * 42  # 64 chars
+    monkeypatch.setattr(
+        "backend.api.routes.auth.get_device_fingerprint",
+        lambda: machine_b,
+    )
+
+    # Direct /unlock fails on B before recovery.
+    with pytest.raises(HTTPException) as exc_info:
+        await unlock(req, UnlockRequest(password="OldPassword1"))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "device_mismatch"
+
+    # Recover with the recovery code → rebinds to B.
+    await recover(
+        req,
+        RecoverRequest(recovery_code=old_rc, new_password="NewPassword1"),
+    )
+
+    b_device_hash = device_hash_path.read_text()
+    assert b_device_hash != a_device_hash, ".device.hash must rotate on recovery"
+
+    # /unlock now works on B with the new password.
+    unlock_response = await unlock(req, UnlockRequest(password="NewPassword1"))
+    assert unlock_response.session_token
+
+    # If we then "go back to A", it should fail — the vault is now bound to B.
+    monkeypatch.setattr(
+        "backend.api.routes.auth.get_device_fingerprint",
+        lambda: "test-device-" + "0" * 52,  # the original conftest constant
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await unlock(req, UnlockRequest(password="NewPassword1"))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "device_mismatch"

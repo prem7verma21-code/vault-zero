@@ -29,13 +29,14 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from backend.api.routes.auth import require_session
-from backend.core.crypto import encrypt, zero_memory
+from backend.core.crypto import encrypt, decrypt, zero_memory
 from backend.database.models import (
     get_db_path,
     get_connection,
     insert_vault_item,
     list_vault_items,
     delete_vault_item,
+    get_vault_item,
     append_audit_log,
     get_audit_log,
 )
@@ -102,6 +103,19 @@ class DeleteItemResponse(BaseModel):
     """Response for a successful DELETE."""
     deleted: bool
     id: str
+
+
+class RevealItemResponse(BaseModel):
+    """Response for POST /items/{id}/reveal — the decrypted secret value.
+
+    The value is only ever held in the response body. The caller is expected
+    to display it for a short window (UI: 30 seconds, then auto-hide) and not
+    cache it. The bytearray copy on the server is zeroed before this returns.
+    """
+    id: str
+    label: str
+    value: str
+    expires_at: int  # Unix seconds — UI uses this to drive the auto-hide countdown
 
 
 class AuditLogEntry(BaseModel):
@@ -308,6 +322,80 @@ async def delete_item(
         )
 
     return DeleteItemResponse(deleted=True, id=item_id)
+
+
+@router.post(
+    "/items/{item_id}/reveal",
+    response_model=RevealItemResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Decrypt and return a single vault item's value (UI auto-hides after 30s)",
+)
+@limiter.limit("60/minute")
+async def reveal_item(
+    request: Request,
+    item_id: str,
+    session_key: bytearray = Depends(require_session),
+) -> RevealItemResponse:
+    """Decrypts and returns the plaintext value of a vault item to the UI.
+
+    This is the user-facing counterpart of /agent/request_key. Auth is the
+    standard session token (the human looking at their own vault), there are
+    no capability cards involved, and any item the unlocked vault contains
+    can be revealed.
+
+    Steps:
+      1. Look up item by id (404 if missing)
+      2. Decrypt the stored payload into a temporary bytearray
+      3. Decode to string for the response
+      4. Audit-log {label, action="reveal_item"}; never the value
+      5. Zero the bytearray in finally before returning
+
+    The response carries `expires_at = now + 30` so the UI can drive a visible
+    countdown without trusting the client clock for absolute timing.
+    """
+    db_path = get_db_path()
+    decrypted: bytearray | None = None
+
+    try:
+        with get_connection(db_path, session_key) as conn:
+            item = get_vault_item(conn, item_id)
+            if item is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Vault item '{item_id}' not found",
+                )
+
+            payload_dict = json.loads(item["encrypted_payload"])
+            decrypted = decrypt(payload_dict, session_key)
+            plaintext_value = decrypted.decode("utf-8")
+
+            append_audit_log(
+                conn,
+                action="reveal_item",
+                result="success",
+                label_accessed=item["label"],
+            )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Database error during reveal_item: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reveal vault item",
+        )
+    finally:
+        # Zero our local bytearray copy; the immutable str escapes via the
+        # response body and is unreachable once the response is serialized.
+        if decrypted is not None:
+            zero_memory(decrypted)
+
+    return RevealItemResponse(
+        id=item_id,
+        label=item["label"],
+        value=plaintext_value,
+        expires_at=int(time.time()) + 30,
+    )
 
 
 @router.get(

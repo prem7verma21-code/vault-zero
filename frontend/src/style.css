@@ -367,6 +367,63 @@ select {
   opacity: 1;
 }
 
+/* Reveal button — shown next to delete on every dashboard row.
+   Same compact look as the delete X, but hover lifts to accent (green)
+   instead of danger (red) so the affordance is clearly distinct. */
+.item-reveal-btn {
+  background: transparent;
+  color: var(--dim);
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  margin-right: 6px;
+  transition: color var(--transition), border-color var(--transition);
+}
+
+.item-reveal-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.item-reveal-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Inline plaintext value box — appears in place of the label while a row
+   is revealed. Monospace + code-bg makes it visually obvious this is a
+   secret being briefly displayed, not the regular label text. */
+.reveal-value-box {
+  flex-grow: 1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  margin: 0 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;  /* let the user copy the value while it's visible */
+}
+
+/* Countdown to auto-hide. Matches the permission-timer styling so users
+   immediately associate it with "this is going away soon". */
+.reveal-timer {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--danger);
+  font-weight: 500;
+  margin-right: 8px;
+  min-width: 28px;
+  text-align: right;
+}
+
 /* Bottom Bar Pinning */
 .footer-actions {
   flex-shrink: 0;

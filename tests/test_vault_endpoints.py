@@ -277,3 +277,51 @@ def test_post_item_requires_auth(client):
         json={"category": "api_key", "label": "X", "value": "y"},
     )
     assert resp.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# REVEAL ENDPOINT (Step 1.13) — POST /items/{id}/reveal
+# ---------------------------------------------------------------------------
+
+def test_reveal_returns_decrypted_value(client, auth_token):
+    """POST /vault/items/{id}/reveal returns the plaintext + a 30s expiry."""
+    import time as _t
+    headers = _make_auth_headers(auth_token)
+
+    add_resp = client.post(
+        "/api/v1/vault/items",
+        json={"category": "api_key", "label": "Reveal Me", "value": "sk-reveal-secret-42"},
+        headers=headers,
+    )
+    assert add_resp.status_code == 201
+    item_id = add_resp.json()["id"]
+
+    before = int(_t.time())
+    reveal_resp = client.post(
+        f"/api/v1/vault/items/{item_id}/reveal",
+        headers=headers,
+    )
+    assert reveal_resp.status_code == 200, f"Reveal failed: {reveal_resp.text}"
+    body = reveal_resp.json()
+
+    assert body["id"] == item_id
+    assert body["label"] == "Reveal Me"
+    assert body["value"] == "sk-reveal-secret-42"
+    # expires_at should be ~30s in the future, within a 5s tolerance
+    assert before + 25 <= body["expires_at"] <= before + 35
+
+
+def test_reveal_unknown_id_returns_404(client, auth_token):
+    """Revealing an item that doesn't exist must return 404."""
+    headers = _make_auth_headers(auth_token)
+    fake_id = "00000000-0000-0000-0000-000000000000"
+
+    resp = client.post(f"/api/v1/vault/items/{fake_id}/reveal", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_reveal_requires_auth(client):
+    """POST /vault/items/{id}/reveal without a session token must be rejected."""
+    fake_id = "00000000-0000-0000-0000-000000000000"
+    resp = client.post(f"/api/v1/vault/items/{fake_id}/reveal")
+    assert resp.status_code in (401, 403)

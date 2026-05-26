@@ -31,6 +31,56 @@ let activePermissionRequestId = null;
 // permission dialog is resolved (approved, denied, or timed out).
 let permCountdownInterval = null;
 
+// Cleanup function for the currently-revealed vault item, or null when nothing
+// is shown. Set whenever a Reveal button is clicked. Calling it restores the
+// row to its hidden state and clears its countdown timer. Single-reveal-at-a-
+// time policy: clicking another Reveal first calls this, then opens the new one.
+let activeRevealCleanup = null;
+
+// Tracks whether the vault is currently unlocked. Drives the window-level idle
+// auto-lock timer below — we only start the timer while unlocked, and we stop
+// it as soon as the vault locks (manually, via idle expiry, or on app close).
+let isUnlocked = false;
+
+// Idle auto-lock: if the user has not interacted with the window for this many
+// milliseconds while the vault is unlocked, we lock automatically. This is
+// distinct from the per-item reveal timer (which is server-driven via
+// `expires_at` and lives inside handleRevealItem).
+const IDLE_LOCK_MS = 30 * 1000;
+let idleLockTimeoutId = null;
+
+function resetIdleTimer() {
+  if (!isUnlocked) return;
+  if (idleLockTimeoutId !== null) {
+    clearTimeout(idleLockTimeoutId);
+  }
+  idleLockTimeoutId = setTimeout(() => {
+    console.log('idle lock triggered');
+    performLock();
+  }, IDLE_LOCK_MS);
+}
+
+function startIdleTimer() {
+  isUnlocked = true;
+  resetIdleTimer();
+}
+
+function stopIdleTimer() {
+  isUnlocked = false;
+  if (idleLockTimeoutId !== null) {
+    clearTimeout(idleLockTimeoutId);
+    idleLockTimeoutId = null;
+  }
+}
+
+// Any of these events count as "user is here" — reset the countdown.
+// Passive listeners so we never block scroll/input. Attached once at module
+// load; resetIdleTimer is a no-op while the vault is locked, so leaving them
+// permanently registered is cheap and avoids add/remove churn on every lock.
+['mousemove', 'keydown', 'click'].forEach(evt => {
+  document.addEventListener(evt, resetIdleTimer, { passive: true });
+});
+
 
 // ---------------------------------------------------------------------------
 // SCREEN NAVIGATION
@@ -89,6 +139,7 @@ async function handleUnlock() {
       unlockPasswordInput.value = '';
       showScreen('dashboard');
       loadDashboard();
+      startIdleTimer();
     } else {
       // result.error comes from the main process catching a FastAPI 401
       unlockError.textContent = result.error || 'Wrong password.';
@@ -169,6 +220,14 @@ async function loadDashboard() {
       label.textContent = item.label;
       label.title = item.label; // tooltip for long labels
 
+      const revealBtn = document.createElement('button');
+      revealBtn.className = 'item-reveal-btn';
+      revealBtn.textContent = 'Reveal';
+      revealBtn.title = `Reveal "${item.label}" (auto-hides after 30s)`;
+      revealBtn.setAttribute('aria-label', `Reveal ${item.label}`);
+      revealBtn.dataset.state = 'reveal';
+      revealBtn.addEventListener('click', () => handleRevealItem(row, label, revealBtn, item));
+
       const deleteBtn = document.createElement('button');
       deleteBtn.className = 'item-delete-btn';
       deleteBtn.textContent = '✕';
@@ -178,6 +237,7 @@ async function loadDashboard() {
 
       row.appendChild(badge);
       row.appendChild(label);
+      row.appendChild(revealBtn);
       row.appendChild(deleteBtn);
       itemsContainer.appendChild(row);
     });
@@ -211,12 +271,140 @@ async function handleDeleteItem(id, label) {
   }
 }
 
-// Lock the vault and return to the Unlock screen
-btnLock.addEventListener('click', async () => {
+/**
+ * Reveals an item's plaintext value inline for 30 seconds, then auto-hides.
+ *
+ * Single-reveal-at-a-time: if another row is currently revealed, hide it first.
+ * The label span is replaced by a monospace value box and a countdown timer
+ * derived from the server-supplied `expires_at`. While revealed, the button
+ * becomes "Copy" — clicking it copies the value to the clipboard and briefly
+ * shows "Copied!" without affecting the auto-hide countdown. The row only
+ * restores to its label-only state when the timer expires, another row is
+ * revealed, or the vault is locked.
+ *
+ * @param {HTMLElement} row        - The .vault-item row element
+ * @param {HTMLElement} labelEl    - The label span being temporarily replaced
+ * @param {HTMLElement} revealBtn  - The Reveal button (becomes "Copy" while shown)
+ * @param {{id: string, label: string}} item
+ */
+async function handleRevealItem(row, labelEl, revealBtn, item) {
+  // If THIS row is currently revealed, the button acts as Copy — copy the
+  // visible value to the clipboard and flash "Copied!" for 1.5s. The reveal
+  // state and 30s auto-hide countdown are intentionally untouched.
+  if (revealBtn.dataset.state === 'copy') {
+    const valueBox = row.querySelector('.reveal-value-box');
+    const value = valueBox ? valueBox.textContent : '';
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (err) {
+      console.error('[Renderer] Copy revealed value failed:', err);
+      return;
+    }
+    revealBtn.textContent = 'Copied!';
+    setTimeout(() => {
+      // Only revert if we're still in copy state — cleanup may have run.
+      if (revealBtn.dataset.state === 'copy') {
+        revealBtn.textContent = 'Copy';
+      }
+    }, 1500);
+    return;
+  }
+
+  // If a different row is currently revealed, close it first.
+  if (typeof activeRevealCleanup === 'function') {
+    activeRevealCleanup();
+  }
+
+  revealBtn.disabled = true;
+  revealBtn.textContent = '...';
+
+  let response;
+  try {
+    response = await window.vault.revealItem(item.id);
+  } catch (err) {
+    revealBtn.disabled = false;
+    revealBtn.textContent = 'Reveal';
+    alert(`Failed to reveal "${item.label}".`);
+    console.error('[Renderer] revealItem error:', err);
+    return;
+  }
+
+  const value = response && response.value;
+  const expiresAt = response && response.expires_at;
+  if (!value || !expiresAt) {
+    revealBtn.disabled = false;
+    revealBtn.textContent = 'Reveal';
+    return;
+  }
+
+  // Swap the label area for value box + countdown.
+  const valueBox = document.createElement('code');
+  valueBox.className = 'reveal-value-box';
+  valueBox.textContent = value;
+  valueBox.title = value;
+
+  const timer = document.createElement('span');
+  timer.className = 'reveal-timer';
+
+  // Insert the box where the label was. We don't remove labelEl from the DOM —
+  // we just toggle visibility so we can restore it cleanly on cleanup.
+  labelEl.style.display = 'none';
+  row.insertBefore(valueBox, revealBtn);
+  row.insertBefore(timer, revealBtn);
+
+  revealBtn.disabled = false;
+  revealBtn.textContent = 'Copy';
+  revealBtn.dataset.state = 'copy';
+
+  let intervalId = null;
+  let cleanedUp = false;
+
+  function tick() {
+    const remaining = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+    timer.textContent = `${remaining}s`;
+    if (remaining <= 0) {
+      cleanup();
+    }
+  }
+
+  function cleanup() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (intervalId !== null) {
+      clearInterval(intervalId);
+      intervalId = null;
+    }
+    if (valueBox.parentNode) valueBox.parentNode.removeChild(valueBox);
+    if (timer.parentNode) timer.parentNode.removeChild(timer);
+    labelEl.style.display = '';
+    revealBtn.textContent = 'Reveal';
+    revealBtn.dataset.state = 'reveal';
+    revealBtn.disabled = false;
+    if (activeRevealCleanup === cleanup) {
+      activeRevealCleanup = null;
+    }
+  }
+
+  activeRevealCleanup = cleanup;
+
+  tick();
+  intervalId = setInterval(tick, 1000);
+}
+
+// Lock the vault and return to the Unlock screen. Shared by the manual Lock
+// button and the idle auto-lock timer, so any future cleanup that should run
+// on lock belongs here, not in either caller.
+async function performLock() {
+  stopIdleTimer();
   try {
     await window.vault.lock();
   } catch (err) {
     console.error('[Renderer] Lock error:', err);
+  }
+  // Hide any revealed value before changing screens
+  if (typeof activeRevealCleanup === 'function') {
+    activeRevealCleanup();
   }
   showScreen('unlock');
   // Clear any stale permission state when locking
@@ -233,7 +421,9 @@ btnLock.addEventListener('click', async () => {
   if (agentCredentialsOverlay) {
     agentCredentialsOverlay.classList.remove('active');
   }
-});
+}
+
+btnLock.addEventListener('click', performLock);
 
 // Navigate to Add Item screen
 btnAddItem.addEventListener('click', () => {
@@ -984,6 +1174,7 @@ chkSavedCode.addEventListener('change', () => {
 btnContinueToVault.addEventListener('click', () => {
   showScreen('dashboard');
   loadDashboard();
+  startIdleTimer();
 });
 
 // ---------------------------------------------------------------------------

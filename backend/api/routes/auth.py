@@ -27,6 +27,7 @@ from slowapi.util import get_remote_address
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 from backend.core.crypto import derive_key, zero_memory, encrypt, decrypt
+from backend.core.device import get_device_fingerprint
 from backend.core.security import create_session, destroy_session, get_session_key
 from backend.database.models import (
     get_db_path,
@@ -35,6 +36,25 @@ from backend.database.models import (
     get_setting,
     set_setting,
 )
+
+
+# ---------------------------------------------------------------------------
+# DEVICE BINDING (Step 1.12)
+# ---------------------------------------------------------------------------
+#
+# Every Argon2id call below uses `password + ":" + device_fingerprint` as the
+# input. Same machine + same password → same key. Different machine → wrong
+# key → SQLCipher refuses to open the file. Recovery is the deliberate exit
+# ramp: /recover writes a fresh device hash for the new machine.
+
+def _bound_password(password: str) -> str:
+    """Combines the user's password with this machine's fingerprint.
+
+    The colon separator prevents trivial collisions between (password="a:bc")
+    and (password="a", fingerprint="bc"). Because the fingerprint is itself
+    a 64-char SHA-256 hex digest, the combined string is always >= 65 chars.
+    """
+    return f"{password}:{get_device_fingerprint()}"
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +241,18 @@ def _generate_recovery_code() -> str:
 async def unlock(request: Request, body: UnlockRequest) -> UnlockResponse:
     """Derives the encryption key from the master password and opens a session.
 
-    On first unlock ever (no hash stored yet), it initializes the database and 
+    On first unlock ever (no hash stored yet), it initializes the database and
     saves the password hash. On subsequent unlocks, it compares against the hash
     and returns HTTP 401 on failure.
+
+    Device binding (Step 1.12): if a `<db>.device.hash` side-file exists and
+    doesn't match this machine's fingerprint, return 403 device_mismatch *before*
+    deriving any key. The fingerprint is also mixed into the Argon2id input,
+    so even a tampered side-file can't open the vault on the wrong machine.
     """
     db_path = get_db_path()
     salt_path = str(Path(db_path).with_suffix(".salt"))
+    device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
 
     db_exists = Path(db_path).exists()
     salt_exists = Path(salt_path).exists()
@@ -237,6 +263,23 @@ async def unlock(request: Request, body: UnlockRequest) -> UnlockResponse:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid password",
         )
+
+    # Step 1.12 — fast-path device binding check.
+    # If a previous setup already bound this vault to a machine, reject early
+    # with a clear "device_mismatch" error instead of the generic 401 the
+    # KDF mismatch would produce. Recovery is the deliberate path off the
+    # original machine.
+    if Path(device_hash_path).exists():
+        try:
+            with open(device_hash_path, "r") as f:
+                stored_device_hash = f.read().strip()
+        except Exception:
+            stored_device_hash = ""
+        if stored_device_hash and not verify_password(get_device_fingerprint(), stored_device_hash):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="device_mismatch",
+            )
 
     # Resolve salt if exists
     salt = None
@@ -249,21 +292,27 @@ async def unlock(request: Request, body: UnlockRequest) -> UnlockResponse:
 
     key = None
     try:
-        # Derive the key — derive_key() zeros the password bytes internally
-        key, salt = derive_key(body.password, salt)
+        # Derive the key from password + machine fingerprint. derive_key() zeros
+        # its password bytes internally; the bound string is built and discarded
+        # in this scope.
+        key, salt = derive_key(_bound_password(body.password), salt)
 
         if not db_exists:
             # FIRST unlock ever: initialize database and store hash
             initialize_database(db_path, key)
-            
+
             # Save the salt companion file
             Path(salt_path).parent.mkdir(parents=True, exist_ok=True)
             with open(salt_path, "wb") as f:
                 f.write(salt)
 
-            pw_hash = hash_password(body.password)
+            pw_hash = hash_password(_bound_password(body.password))
             with get_connection(db_path, key) as conn:
                 set_setting(conn, "master_password_hash", pw_hash)
+
+            # Bind this vault to the current machine.
+            with open(device_hash_path, "w") as f:
+                f.write(hash_password(get_device_fingerprint()))
         else:
             # Subsequent unlocks: attempt to connect and retrieve/verify hash
             try:
@@ -278,15 +327,22 @@ async def unlock(request: Request, body: UnlockRequest) -> UnlockResponse:
 
             if stored_hash is None:
                 # Fallback: if database exists but has no hash (edge case), initialize/store it
-                pw_hash = hash_password(body.password)
+                pw_hash = hash_password(_bound_password(body.password))
                 with get_connection(db_path, key) as conn:
                     set_setting(conn, "master_password_hash", pw_hash)
-            elif not verify_password(body.password, stored_hash):
+            elif not verify_password(_bound_password(body.password), stored_hash):
                 # Password hash does not match
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="invalid password",
                 )
+
+            # Backfill the device hash on a successful unlock if a pre-1.12
+            # vault didn't have one. Lets old vaults gain device binding the
+            # first time they unlock cleanly on the user's actual machine.
+            if not Path(device_hash_path).exists():
+                with open(device_hash_path, "w") as f:
+                    f.write(hash_password(get_device_fingerprint()))
 
         # Store the key in memory, get back a JWT session token
         token = create_session(key)
@@ -375,7 +431,7 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
             try:
                 with open(salt_path, "rb") as f:
                     existing_salt = f.read()
-                existing_key, _ = derive_key(body.password, existing_salt)
+                existing_key, _ = derive_key(_bound_password(body.password), existing_salt)
                 try:
                     with get_connection(db_path, existing_key) as conn:
                         existing_hash = get_setting(conn, "master_password_hash")
@@ -408,8 +464,8 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
     key = None
     recovery_key = None
     try:
-        # Derive the vault key from the chosen password (fresh Argon2id salt)
-        key, salt = derive_key(body.password)
+        # Derive the vault key from password + this machine's fingerprint (Step 1.12)
+        key, salt = derive_key(_bound_password(body.password))
 
         # Create and encrypt the database with the vault key
         initialize_database(db_path, key)
@@ -420,7 +476,9 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
             f.write(salt)
 
         # Derive a SEPARATE recovery key from the recovery code + its own fresh salt.
-        # This key is used ONLY during the /recover flow.
+        # The recovery key is intentionally NOT device-bound: the recovery flow's
+        # whole point is "I'm on a new computer." /recover will rebind the device
+        # hash after a successful re-key.
         recovery_key, recovery_salt = derive_key(recovery_code)
         recovery_salt_path = str(Path(db_path).with_suffix(".recovery.salt"))
         with open(recovery_salt_path, "wb") as f:
@@ -436,8 +494,8 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
         with open(keyblob_path, "w") as f:
             f.write(json.dumps(key_bundle))
 
-        # Store hashes of both the password and recovery code inside the DB
-        pw_hash = hash_password(body.password)
+        # Store hashes of both the password (device-bound) and recovery code (raw).
+        pw_hash = hash_password(_bound_password(body.password))
         rc_hash = hash_password(recovery_code)
 
         with get_connection(db_path, key) as conn:
@@ -453,6 +511,13 @@ async def setup(request: Request, body: SetupRequest) -> SetupResponse:
         recovery_hash_path = str(Path(db_path).with_suffix(".recovery.hash"))
         with open(recovery_hash_path, "w") as f:
             f.write(rc_hash)
+
+        # Step 1.12 — bind this vault to the current machine. /unlock checks
+        # this side-file as a fast-path so device-mismatch is reported clearly
+        # instead of looking like a wrong-password 401.
+        device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
+        with open(device_hash_path, "w") as f:
+            f.write(hash_password(get_device_fingerprint()))
 
         # Open a session — same mechanism as /unlock
         token = create_session(key)
@@ -623,8 +688,10 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
             decrypted_items.append((item_id, category, label, bytes(plaintext_ba)))
             zero_memory(plaintext_ba)
 
-        # Derive new vault key from the new master password (fresh random salt)
-        new_key, new_salt = derive_key(body.new_password)
+        # Derive new vault key from the new master password, BOUND to whatever
+        # machine is running this recovery. /recover is the deliberate "I'm on
+        # a new computer" path — so we rebind, not enforce the old binding.
+        new_key, new_salt = derive_key(_bound_password(body.new_password))
 
         # Re-encrypt every item under the new vault key
         reencrypted: list[tuple[str, str]] = []
@@ -640,7 +707,7 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
         new_key_bundle = encrypt(bytes(new_key), new_recovery_key)
         zero_memory(new_recovery_key)
 
-        new_pw_hash = hash_password(body.new_password)
+        new_pw_hash = hash_password(_bound_password(body.new_password))
         new_rc_hash = hash_password(new_recovery_code)
 
         # Re-key the TEMP database file using PRAGMA rekey. The original is
@@ -717,7 +784,9 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
             )
 
         # Overwrite companion files. Order: salt first (needed for any future
-        # /unlock), then keyblob, then recovery salt + recovery hash.
+        # /unlock), then keyblob, then recovery salt + recovery hash, finally
+        # the device hash. The device hash is rebound to *this* machine — that
+        # is what makes /recover the legitimate "I'm on a new computer" path.
         with open(salt_path, "wb") as f:
             f.write(new_salt)
         with open(keyblob_path, "w") as f:
@@ -726,6 +795,9 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
             f.write(new_recovery_salt)
         with open(recovery_hash_path, "w") as f:
             f.write(new_rc_hash)
+        device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
+        with open(device_hash_path, "w") as f:
+            f.write(hash_password(get_device_fingerprint()))
 
         # Open a new session under the new key
         token = create_session(new_key)
