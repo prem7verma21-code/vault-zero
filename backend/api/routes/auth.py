@@ -35,6 +35,10 @@ from backend.database.models import (
     initialize_database,
     get_setting,
     set_setting,
+    replay_pending_recovery,
+    RECOVER_JOURNAL_SUFFIX,
+    REKEY_TMP_SUFFIX,
+    _write_journal_file,
 )
 
 
@@ -253,6 +257,10 @@ async def unlock(request: Request, body: UnlockRequest) -> UnlockResponse:
     db_path = get_db_path()
     salt_path = str(Path(db_path).with_suffix(".salt"))
     device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
+
+    # Heal a /recover that crashed mid-swap before reading anything: the
+    # journal replay completes the DB + companion file set atomically.
+    replay_pending_recovery(db_path)
 
     db_exists = Path(db_path).exists()
     salt_exists = Path(salt_path).exists()
@@ -569,8 +577,12 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
       8. Re-encrypt all items with new vault_key
       9. On the temp DB only: update all rows, update settings, PRAGMA rekey
      10. Verify the rekeyed temp DB opens cleanly with new_key
-     11. os.replace(temp, db_path) — atomic swap (Bug 2 — no half-rekeyed file)
-     12. Write new companion files; create new session; return new recovery code
+     11. Journaled swap: stage all new companion files as *.rekey.tmp, write
+         a .recover.journal listing every (tmp, final) pair with the DB first,
+         then replay the journal (os.replace per pair) and delete it. A crash
+         at any point either changed nothing or is completed idempotently by
+         replay_pending_recovery() on the next /recover or /unlock.
+     12. Create a new session under the new key; return the new recovery code
     """
     if len(body.new_password) < 8:
         raise HTTPException(
@@ -583,6 +595,10 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
     recovery_salt_path = str(Path(db_path).with_suffix(".recovery.salt"))
     keyblob_path = str(Path(db_path).with_suffix(".keyblob"))
     recovery_hash_path = str(Path(db_path).with_suffix(".recovery.hash"))
+
+    # Heal a previous /recover that crashed mid-swap: the journal makes the
+    # DB + companion file set complete idempotently before we touch anything.
+    replay_pending_recovery(db_path)
 
     if not Path(db_path).exists() or not Path(recovery_salt_path).exists() or not Path(keyblob_path).exists():
         raise HTTPException(
@@ -627,6 +643,9 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
 
     # Temp DB path lives next to the real one; os.replace is atomic on the same volume.
     temp_db_path = db_path + ".rekey.tmp"
+    # (tmp, final) pairs staged for the journaled crash-safe swap; filled in
+    # below. The finally block cleans these up only when no journal exists.
+    staged: list[tuple[str, str]] = []
 
     try:
         # Derive the recovery key from the provided recovery code + stored recovery salt
@@ -770,47 +789,71 @@ async def recover(request: Request, body: RecoverRequest) -> RecoverResponse:
                 detail="recovery_failed",
             )
 
-        # The temp DB is now rekeyed and verified. Atomic swap into place.
+        # The temp DB is now rekeyed and verified. Swap it AND the companion
+        # files into place as one crash-safe set via a journal. Writing the
+        # companions directly (the old code) left a window where a crash
+        # between os.replace(db) and the salt write bricked the vault: the DB
+        # would be encrypted with the new key while .salt still held the old
+        # salt, making the new key underivable.
+        device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
+
+        def _stage(final_path: str, data: bytes) -> None:
+            tmp_path = final_path + REKEY_TMP_SUFFIX
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            staged.append((tmp_path, final_path))
+
         try:
-            os.replace(temp_db_path, db_path)
+            _stage(salt_path, new_salt)
+            _stage(keyblob_path, json.dumps(new_key_bundle).encode("utf-8"))
+            _stage(recovery_salt_path, new_recovery_salt)
+            _stage(recovery_hash_path, new_rc_hash.encode("utf-8"))
+            # The device hash is rebound to *this* machine — that is what
+            # makes /recover the legitimate "I'm on a new computer" path.
+            _stage(device_hash_path,
+                   hash_password(get_device_fingerprint()).encode("utf-8"))
+            journal_path = db_path + RECOVER_JOURNAL_SUFFIX
+            # DB pair first: once it swaps, the companions MUST follow, and
+            # the journal guarantees replay_pending_recovery() finishes them.
+            _write_journal_file(journal_path,
+                                [(temp_db_path, db_path)] + staged)
+            # Best-effort replay now (never raises); success is the journal
+            # being gone. A leftover journal means the swap is incomplete —
+            # fail loudly and leave everything staged for the next access.
+            replay_pending_recovery(db_path)
+            if Path(journal_path).exists():
+                raise RuntimeError("recovery journal replay incomplete")
         except Exception as exc:
             import logging
             logging.getLogger(__name__).error(
-                "Recovery: atomic replace failed: %s", type(exc).__name__
+                "Recovery: atomic swap failed: %s", type(exc).__name__
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="recovery_failed",
             )
 
-        # Overwrite companion files. Order: salt first (needed for any future
-        # /unlock), then keyblob, then recovery salt + recovery hash, finally
-        # the device hash. The device hash is rebound to *this* machine — that
-        # is what makes /recover the legitimate "I'm on a new computer" path.
-        with open(salt_path, "wb") as f:
-            f.write(new_salt)
-        with open(keyblob_path, "w") as f:
-            f.write(json.dumps(new_key_bundle))
-        with open(recovery_salt_path, "wb") as f:
-            f.write(new_recovery_salt)
-        with open(recovery_hash_path, "w") as f:
-            f.write(new_rc_hash)
-        device_hash_path = str(Path(db_path).with_suffix(".device.hash"))
-        with open(device_hash_path, "w") as f:
-            f.write(hash_password(get_device_fingerprint()))
-
         # Open a new session under the new key
         token = create_session(new_key)
         return RecoverResponse(session_token=token, new_recovery_code=new_recovery_code)
 
     finally:
-        # Clean up the temp file in any failure path. os.replace already
-        # consumed it on the success path, so missing-file is fine.
-        if Path(temp_db_path).exists():
-            try:
-                os.remove(temp_db_path)
-            except Exception:
-                pass
+        # Clean up staging files in failure paths — BUT only when no journal
+        # exists. A leftover journal means the swap was staged and the process
+        # is dying mid-swap: the staged temps + journal must survive so
+        # replay_pending_recovery() can complete the swap on next access.
+        # os.replace already consumed the temps on the success path, so
+        # missing-file is fine there.
+        _journal_path = db_path + RECOVER_JOURNAL_SUFFIX
+        if not Path(_journal_path).exists():
+            for _tmp in [temp_db_path] + [t for t, _ in staged]:
+                try:
+                    if Path(_tmp).exists():
+                        os.remove(_tmp)
+                except Exception:
+                    pass
         if recovery_key is not None:
             zero_memory(recovery_key)
         if old_key is not None:

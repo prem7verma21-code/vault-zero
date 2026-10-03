@@ -371,3 +371,188 @@ async def test_recover_rotates_device_binding(isolated_db, monkeypatch):
         await unlock(req, UnlockRequest(password="NewPassword1"))
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "device_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# /recover crash-safety: journaled swap (Bug 2 follow-up)
+# ---------------------------------------------------------------------------
+# Jules flagged rekey-on-live-DB corruption; the copy+atomic-swap fixed the
+# DB half, but companions were still overwritten in place AFTER the DB swap.
+# A crash in that window bricked the vault (new-key DB + old .salt). These
+# tests simulate crashes at both boundaries of the journaled swap.
+
+def _derive(password: str, db_path: str) -> bytes:
+    """Re-derive the vault key exactly like /unlock does (stored salt)."""
+    from backend.core.crypto import derive_key
+    from backend.api.routes.auth import _bound_password
+
+    salt = Path(db_path).with_suffix(".salt").read_bytes()
+    key, _ = derive_key(_bound_password(password), salt)
+    return key
+
+
+def _insert_test_item(db_path: str, key: bytes, item_id: str, plaintext: bytes) -> None:
+    """Insert one encrypted item directly, bypassing the vault routes."""
+    import time
+    from backend.core.crypto import encrypt
+    from backend.database.models import get_connection
+
+    payload = encrypt(plaintext, key)
+    with get_connection(db_path, key) as conn:
+        conn.execute(
+            "INSERT INTO vault_items (id, category, label, encrypted_payload,"
+            " created_at) VALUES (?, ?, ?, ?, ?)",
+            (item_id, "test", "crash-item", json.dumps(payload),
+             int(time.time())),
+        )
+
+
+def _decrypt_test_item(db_path: str, key: bytes, item_id: str) -> bytes:
+    from backend.core.crypto import decrypt
+    from backend.database.models import get_connection
+
+    with get_connection(db_path, key) as conn:
+        row = conn.execute(
+            "SELECT encrypted_payload FROM vault_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+    return bytes(decrypt(json.loads(row[0]), key))
+
+
+@pytest.mark.anyio
+async def test_recover_crash_mid_swap_heals_on_next_unlock(isolated_db, monkeypatch):
+    """Kill the process between the DB swap and the companion swaps.
+
+    Simulates a crash after os.replace(temp_db -> db) but before the
+    companion files are swapped. The next /unlock must heal the set via
+    the journal and the vault must open with the NEW password, data intact.
+    """
+    import os as _os
+    from backend.database.models import RECOVER_JOURNAL_SUFFIX
+
+    req = get_mock_request()
+    setup_resp = await setup(req, SetupRequest(password="OldPassword1"))
+    old_rc = setup_resp.recovery_code
+    db_path = isolated_db
+
+    old_key = _derive("OldPassword1", db_path)
+    _insert_test_item(db_path, old_key, "item-1", b"super-secret-data")
+
+    # Crash after the FIRST os.replace (the DB swap) inside the replay.
+    # Scoped to a nested monkeypatch context so the isolated_db fixture's
+    # get_db_path patch stays intact after the "reboot".
+    real_replace = _os.replace
+    calls = {"n": 0}
+
+    def crashing_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("simulated crash mid-swap")
+        return real_replace(src, dst)
+
+    with monkeypatch.context() as crash:
+        crash.setattr("os.replace", crashing_replace)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await recover(
+                req,
+                RecoverRequest(recovery_code=old_rc, new_password="NewPassword1"),
+            )
+        assert exc_info.value.status_code == 500
+    # exiting the context = "reboot": crash injection removed
+
+    # The crash left the journal behind with the remaining staged pairs.
+    journal_path = db_path + RECOVER_JOURNAL_SUFFIX
+    assert Path(journal_path).exists(), "journal must survive the crash"
+
+    # The very next /unlock heals the swap via the journal replay hook...
+    unlock_resp = await unlock(req, UnlockRequest(password="NewPassword1"))
+    assert unlock_resp.session_token, "unlock with new password must work after heal"
+
+    # ...the journal is gone, no staging files linger...
+    assert not Path(journal_path).exists(), "journal must be consumed by replay"
+    leftovers = list(Path(db_path).parent.glob("*.rekey.tmp*"))
+    assert not leftovers, f"staged temps must be gone, found: {leftovers}"
+
+    # ...and the data survived the crash, re-encrypted under the new key.
+    new_key = _derive("NewPassword1", db_path)
+    assert _decrypt_test_item(db_path, new_key, "item-1") == b"super-secret-data"
+
+
+@pytest.mark.anyio
+async def test_recover_crash_before_journal_keeps_old_vault(isolated_db, monkeypatch):
+    """Crash before the journal is written: nothing observable may change."""
+    import os as _os
+    from backend.api.routes import auth as auth_mod
+    from backend.database.models import RECOVER_JOURNAL_SUFFIX
+
+    req = get_mock_request()
+    setup_resp = await setup(req, SetupRequest(password="OldPassword1"))
+    old_rc = setup_resp.recovery_code
+    db_path = isolated_db
+
+    old_key = _derive("OldPassword1", db_path)
+    _insert_test_item(db_path, old_key, "item-1", b"untouched-data")
+
+    def crash_before_journal(journal_path, pairs):
+        raise OSError("simulated crash before journal write")
+
+    # Scope the crash to the first attempt only; the retry below must run clean.
+    with monkeypatch.context() as crash:
+        crash.setattr(auth_mod, "_write_journal_file", crash_before_journal)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await recover(
+                req,
+                RecoverRequest(recovery_code=old_rc, new_password="NewPassword2"),
+            )
+        assert exc_info.value.status_code == 500
+
+    # No journal, no staged temps: the vault is exactly as before the attempt.
+    assert not Path(db_path + RECOVER_JOURNAL_SUFFIX).exists()
+    leftovers = [p for p in Path(db_path).parent.iterdir()
+                 if p.suffixes[-2:] == [".rekey", ".tmp"] or p.name.endswith(".rekey.tmp")]
+    assert not leftovers, f"staging files must be cleaned, found: {leftovers}"
+
+    unlock_resp = await unlock(req, UnlockRequest(password="OldPassword1"))
+    assert unlock_resp.session_token, "old password must still unlock"
+    assert _decrypt_test_item(db_path, old_key, "item-1") == b"untouched-data"
+
+    # And the same recovery code still works for a real retry.
+    retry_resp = await recover(
+        req, RecoverRequest(recovery_code=old_rc, new_password="NewPassword3"))
+    assert retry_resp.session_token
+
+
+@pytest.mark.anyio
+async def test_replay_pending_recovery_is_idempotent(isolated_db):
+    """Replaying twice (or with no journal) is safe."""
+    import json as _json
+    from backend.database.models import (
+        replay_pending_recovery, RECOVER_JOURNAL_SUFFIX)
+
+    db_path = isolated_db
+    journal_path = db_path + RECOVER_JOURNAL_SUFFIX
+
+    assert replay_pending_recovery(db_path) is False  # no journal: no-op
+
+    # Hand-stage a fake swap: tmp files + journal.
+    staged_a = db_path + ".a.rekey.tmp"
+    staged_b = db_path + ".b.rekey.tmp"
+    final_a = db_path + ".a"
+    final_b = db_path + ".b"
+    Path(staged_a).write_bytes(b"A-new")
+    Path(staged_b).write_bytes(b"B-new")
+    Path(final_a).write_bytes(b"A-old")
+    Path(final_b).write_bytes(b"B-old")
+    with open(journal_path, "w") as f:
+        _json.dump({"pairs": [[staged_a, final_a], [staged_b, final_b]]}, f)
+
+    assert replay_pending_recovery(db_path) is True
+    assert Path(final_a).read_bytes() == b"A-new"
+    assert Path(final_b).read_bytes() == b"B-new"
+    assert not Path(journal_path).exists()
+
+    # Second replay: journal gone, must be a harmless no-op.
+    assert replay_pending_recovery(db_path) is False
+    assert Path(final_a).read_bytes() == b"A-new"

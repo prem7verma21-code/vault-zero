@@ -19,6 +19,9 @@ Tables:
 import sqlite3
 import time
 import uuid
+import json
+import logging
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -107,6 +110,64 @@ def get_db_path() -> str:
             base_dir = str(Path.home() / ".config")
             
     return str(Path(base_dir) / "Vault-Zero" / "vault.db")
+
+
+# ---------------------------------------------------------------------------
+# CRASH-SAFE RECOVERY SWAP
+# ---------------------------------------------------------------------------
+# /recover must replace the database file AND its companion files
+# (.salt, .keyblob, .recovery.salt, .recovery.hash, .device.hash) as one
+# atomic set. os.replace() is atomic per file, but a crash between the
+# individual replaces would brick the vault (e.g. DB re-encrypted with the
+# new key while .salt still holds the old salt -> new key underivable).
+#
+# Protocol (used by /recover):
+#   1. Stage every new file next to its final path as "<final>.rekey.tmp",
+#      fsync each one.
+#   2. Write "<db>.recover.journal": JSON {"pairs": [[tmp, final], ...]}
+#      with the DB pair FIRST, fsync it. Nothing observable has changed yet.
+#   3. Replay the journal: os.replace(tmp, final) for each pair whose tmp
+#      still exists, then delete the journal.
+#   4. replay_pending_recovery() re-runs step 3 on next access, so a crash
+#      at ANY point either changed nothing (crash before step 2) or is
+#      completed idempotently on the next /recover or /unlock call.
+
+RECOVER_JOURNAL_SUFFIX = ".recover.journal"
+REKEY_TMP_SUFFIX = ".rekey.tmp"
+
+
+def _write_journal_file(journal_path: str, pairs: list) -> None:
+    """Write the swap journal and fsync it so a crash can't lose it."""
+    with open(journal_path, "w") as f:
+        f.write(json.dumps({"pairs": pairs}))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def replay_pending_recovery(db_path: str) -> bool:
+    """Complete a /recover file swap interrupted by a crash.
+
+    Idempotent: pairs whose temp file is already gone are skipped, so
+    re-running after a partial replay is safe. Returns True when a
+    journal was found (and replayed or attempted), False otherwise.
+    Never raises — a corrupt journal is logged and left for manual
+    inspection rather than blocking vault access.
+    """
+    journal_path = db_path + RECOVER_JOURNAL_SUFFIX
+    if not Path(journal_path).exists():
+        return False
+    try:
+        with open(journal_path, "r") as f:
+            pairs = json.load(f)["pairs"]
+        for tmp_path, final_path in pairs:
+            if Path(tmp_path).exists():
+                os.replace(tmp_path, final_path)
+        os.remove(journal_path)
+    except Exception as exc:  # noqa: BLE001 - must not block vault access
+        logging.getLogger(__name__).error(
+            "replay_pending_recovery failed: %s", type(exc).__name__
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
